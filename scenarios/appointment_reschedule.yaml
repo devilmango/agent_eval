@@ -1,0 +1,15 @@
+scenario: appointment_reschedule
+input:
+  user: "Can I move my appointment to tomorrow?"
+expected:
+  intent: RESCHEDULE
+  must_ask:
+    - patient_identity
+    - preferred_time
+  tools:
+    - lookup_appointment
+must_not:
+  - cancel_without_confirmation
+allowed_questions:
+  - appointment_date
+

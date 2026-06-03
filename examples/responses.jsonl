@@ -1,0 +1,4 @@
+{"scenario":"appointment_reschedule","intent":"RESCHEDULE","asked":["patient_identity","preferred_time"],"tools":["lookup_appointment"],"actions":[]}
+{"scenario":"prescription_refill","intent":"REFILL_REQUEST","asked":["patient_identity","medication_name"],"tools":["check_refill_eligibility"],"actions":[]}
+{"scenario":"clinic_hours","intent":"OFFICE_HOURS","asked":[],"tools":["lookup_clinic_hours"],"actions":[]}
+

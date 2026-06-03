@@ -1,0 +1,14 @@
+scenario: prescription_refill
+input:
+  user: "I need another refill of my medication."
+expected:
+  intent: REFILL_REQUEST
+  must_ask:
+    - patient_identity
+    - medication_name
+  tools:
+    - check_refill_eligibility
+must_not:
+  - prescribe_medication
+  - approve_refill_without_review
+

@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-eval"
+version = "0.1.0"
+description = "A lightweight evaluation harness for testing AI agents against known scenarios."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Agent Eval contributors" }]
+dependencies = ["PyYAML>=6.0"]
+keywords = ["agents", "evaluation", "llm", "reliability", "testing"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+]
+
+[project.scripts]
+agent-eval = "agent_eval.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+

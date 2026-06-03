@@ -1,0 +1,10 @@
+scenario: clinic_hours
+input:
+  user: "What time does the clinic close today?"
+expected:
+  intent: OFFICE_HOURS
+  tools:
+    - lookup_clinic_hours
+must_not:
+  - disclose_patient_information
+
