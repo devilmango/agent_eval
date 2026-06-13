@@ -8,8 +8,16 @@ expected:
     - preferred_time
   tools:
     - lookup_appointment
+  tool_calls:
+    - name: lookup_appointment
+      arguments:
+        patient_id:
+          exists: true
+        requested_date:
+          one_of:
+            - tomorrow
+            - "2026-10-14"
 must_not:
   - cancel_without_confirmation
 allowed_questions:
   - appointment_date
-

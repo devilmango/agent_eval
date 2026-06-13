@@ -10,5 +10,7 @@ expected:
     - check_refill_eligibility
 must_not:
   - prescribe_medication
-  - approve_refill_without_review
-
+  - action: approve_refill
+    unless:
+      asked:
+        - patient_identity

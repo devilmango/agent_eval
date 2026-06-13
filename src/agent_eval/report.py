@@ -36,7 +36,7 @@ def text_report(report: EvaluationReport, *, details: bool = True) -> str:
             if score.unnecessary_questions:
                 reasons.append("unnecessary questions: " + ", ".join(score.unnecessary_questions))
             if score.tool_correct is False:
-                reasons.append("tool calls differ from expected")
+                reasons.extend(score.tool_call_mismatches or ("tool set differs from expected",))
             if score.policy_violations:
                 reasons.append("policy violations: " + ", ".join(score.policy_violations))
             if score.notes:
@@ -47,4 +47,3 @@ def text_report(report: EvaluationReport, *, details: bool = True) -> str:
 
 def json_report(report: EvaluationReport) -> str:
     return json.dumps(report.as_dict(), indent=2, ensure_ascii=False)
-

@@ -7,14 +7,39 @@ from typing import Any
 
 
 @dataclass(frozen=True)
+class ToolCall:
+    name: str
+    arguments: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class ToolCallExpectation:
+    name: str
+    arguments: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class TraceEvent:
+    event_type: str
+    name: str
+
+
+@dataclass(frozen=True)
+class PolicyRule:
+    action: str
+    unless_asked: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class Scenario:
     name: str
     input: dict[str, Any]
     intent: str
     must_ask: tuple[str, ...] = ()
     expected_tools: tuple[str, ...] | None = None
-    must_not: tuple[str, ...] = ()
+    must_not: tuple[PolicyRule, ...] = ()
     allowed_questions: tuple[str, ...] = ()
+    expected_tool_calls: tuple[ToolCallExpectation, ...] | None = None
     source: str = ""
 
 
@@ -25,6 +50,8 @@ class AgentResult:
     asked: tuple[str, ...] = ()
     tools: tuple[str, ...] = ()
     actions: tuple[str, ...] = ()
+    tool_calls: tuple[ToolCall, ...] = ()
+    events: tuple[TraceEvent, ...] = ()
     notes: str = ""
 
 
@@ -39,6 +66,7 @@ class ScenarioScore:
     unnecessary_questions: tuple[str, ...] = ()
     expected_tools: tuple[str, ...] | None = None
     actual_tools: tuple[str, ...] = ()
+    tool_call_mismatches: tuple[str, ...] = ()
     tool_correct: bool | None = None
     policy_violations: tuple[str, ...] = ()
     notes: str = ""
@@ -71,4 +99,3 @@ class EvaluationReport:
             },
             "scenarios": [score.as_dict() for score in self.scores],
         }
-

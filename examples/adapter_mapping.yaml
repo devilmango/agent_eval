@@ -1,0 +1,8 @@
+fields:
+  scenario: metadata.scenario_id
+  intent: agent.final.intent
+  asked: agent.final.questions[*]
+  tools: trace.tool_calls[*].name
+  tool_calls: trace.tool_calls
+  actions: trace.actions
+  events: trace.events
