@@ -72,3 +72,45 @@ class CliTests(unittest.TestCase):
                 ]
             )
         self.assertEqual(status, 1)
+
+    def test_run_command_writes_html_report(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "report.html"
+            status = main(
+                [
+                    "run",
+                    str(ROOT / "scenarios"),
+                    "--responses",
+                    str(ROOT / "examples/responses.jsonl"),
+                    "--format",
+                    "html",
+                    "--output",
+                    str(output),
+                    "--strict",
+                ]
+            )
+            document = output.read_text(encoding="utf-8")
+        self.assertEqual(status, 0)
+        self.assertIn("<!doctype html>", document.lower())
+        self.assertIn("appointment_reschedule", document)
+
+    def test_repeat_command_writes_html_report(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "repeated.html"
+            status = main(
+                [
+                    "repeat",
+                    str(ROOT / "scenarios"),
+                    "--runs",
+                    str(ROOT / "examples/responses.jsonl"),
+                    str(ROOT / "examples/responses-before.jsonl"),
+                    "--format",
+                    "html",
+                    "--output",
+                    str(output),
+                ]
+            )
+            document = output.read_text(encoding="utf-8")
+        self.assertEqual(status, 1)
+        self.assertIn("Repeated-run report", document)
+        self.assertIn("appointment_reschedule", document)

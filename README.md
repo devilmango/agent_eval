@@ -14,6 +14,8 @@ Agent Eval does not call a model or depend on an agent framework. A small adapte
 - **Policy compliance** — did it avoid actions listed under `must_not`?
 - **Unnecessary questions** — how often did it ask for information outside the required or allowed question set?
 - **Scenario pass rate** — did each scenario satisfy all of its declared checks?
+- **Run-to-run stability** — how consistent are those scores across repeated agent executions?
+- **HTML reports** — can reviewers inspect a run or repeated-run analysis in a browser?
 
 The checks are deterministic and work over structured traces. They don't require an LLM judge, network access, or a model API key.
 
@@ -209,6 +211,25 @@ agent-eval compare scenarios/ \
 
 The comparison exits `1` when the candidate regresses a scenario, `0` otherwise, and `2` for invalid input. Add `--format json` for machine-readable output. Metric deltas are candidate minus baseline; a negative unnecessary-question delta is an improvement.
 
+Analyze variability across repeated executions by passing two or more captured result files:
+
+```bash
+agent-eval repeat scenarios/ \
+  --runs runs/run-01.jsonl runs/run-02.jsonl runs/run-03.jsonl \
+  --strict
+```
+
+Agent Eval analyzes supplied result files; it does not launch the agent or choose a model sampling configuration. The report includes each metric's mean, sample standard deviation, and observed range, plus per-scenario pass frequency and the run numbers that failed. `repeat` requires at least two runs and exits `1` if any run has failed scenarios.
+
+Create a standalone, shareable HTML report for one run or repeated-run analysis:
+
+```bash
+agent-eval run scenarios/ --responses run.jsonl --format html --output report.html
+agent-eval repeat scenarios/ --runs runs/*.jsonl --format html --output stability.html
+```
+
+HTML reports include summary metrics and scenario-level details, escape trace content, and have no external asset or network requirements.
+
 ```bash
 agent-eval run scenarios/ --responses run.jsonl --strict
 ```
@@ -223,6 +244,8 @@ Run the same command after your application creates `run.jsonl`. A failed scenar
 ```
 
 The example assumes your preceding CI steps installed this package and generated the result file. Agent Eval intentionally does not start your agent or manage model credentials.
+
+The included [GitHub Actions workflow](.github/workflows/ci.yml) runs the unit suite across Python 3.10–3.12, evaluates the checked-in sample results, creates an HTML report, and uploads it as a workflow artifact.
 
 ## Understand the metrics
 
@@ -255,11 +278,7 @@ Agent Eval is an early, local-first harness. It evaluates recorded structured tr
 
 ## Next ideas
 
-Potential additions, in a useful implementation order:
-
-1. **Repeated-run analysis** — run scenarios multiple times and report variability, since sampling can make agent behavior nondeterministic.
-2. **HTML reports** — browse scenario-level failures and compare history without parsing console output.
-3. **Framework-specific packages** — optional integrations for common frameworks, built on the adapter protocol without adding framework dependencies to the core package.
+Potential addition: framework-specific packages for common agent frameworks, built on the adapter protocol without adding framework dependencies to the core package.
 
 The repository includes GitHub Actions CI for Python 3.10–3.12, unit validation, and the example evaluation command.
 

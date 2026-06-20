@@ -11,7 +11,8 @@ from typing import Any
 from agent_eval import __version__
 from agent_eval.adapters import AdapterError, PathMappingAdapter, result_as_dict
 from agent_eval.comparison import compare_reports, text_comparison
-from agent_eval.report import json_report, text_report
+from agent_eval.report import html_report, json_report, repeated_html_report, text_report
+from agent_eval.repeated import analyze_repeated_runs, text_repeated_report
 from agent_eval.results import ResultError, load_results
 from agent_eval.scenarios import ScenarioError, load_scenarios
 from agent_eval.scoring import evaluate
@@ -32,7 +33,8 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="JSON Lines file with one agent result per scenario",
     )
-    run.add_argument("--format", choices=("text", "json"), default="text")
+    run.add_argument("--format", choices=("text", "json", "html"), default="text")
+    run.add_argument("--output", type=Path, help="write the report to a file instead of stdout")
     run.add_argument("--strict", action="store_true", help="fail when any scenario result is missing")
     run.add_argument("--quiet-details", action="store_true", help="hide per-scenario failure details")
 
@@ -47,6 +49,13 @@ def build_parser() -> argparse.ArgumentParser:
     compare.add_argument("--candidate", required=True, type=Path, help="candidate JSONL results")
     compare.add_argument("--format", choices=("text", "json"), default="text")
     compare.add_argument("--strict", action="store_true", help="fail when either run is missing results")
+
+    repeat = commands.add_parser("repeat", help="analyze variability across repeated result files")
+    repeat.add_argument("scenarios", type=Path, help="scenario YAML file or directory")
+    repeat.add_argument("--runs", nargs="+", required=True, type=Path, help="two or more JSONL result files")
+    repeat.add_argument("--format", choices=("text", "json", "html"), default="text")
+    repeat.add_argument("--output", type=Path, help="write the report to a file instead of stdout")
+    repeat.add_argument("--strict", action="store_true", help="fail when any run is missing scenario results")
     return parser
 
 
@@ -101,17 +110,44 @@ def main(argv: list[str] | None = None) -> int:
                 print(text_comparison(comparison))
             return 0 if not comparison["regressed_scenarios"] else 1
 
+        if args.command == "repeat":
+            if len(args.runs) < 2:
+                raise ValueError("Repeated-run analysis requires at least two result files")
+            reports = [
+                evaluate(scenarios, load_results(run_path), strict=args.strict)
+                for run_path in args.runs
+            ]
+            repeated = analyze_repeated_runs(reports)
+            if args.format == "json":
+                rendered = json.dumps(repeated, indent=2, ensure_ascii=False)
+            elif args.format == "html":
+                rendered = repeated_html_report(repeated)
+            else:
+                rendered = text_repeated_report(repeated)
+            _write_output(args.output, rendered)
+            return 0 if all(report.failed == 0 for report in reports) else 1
+
         results = load_results(args.responses)
         report = evaluate(scenarios, results, strict=args.strict)
-    except (AdapterError, ScenarioError, ResultError, OSError) as exc:
+    except (AdapterError, ScenarioError, ResultError, OSError, ValueError) as exc:
         print(f"agent-eval: error: {exc}", file=sys.stderr)
         return 2
 
     if args.format == "json":
-        print(json_report(report))
+        rendered = json_report(report)
+    elif args.format == "html":
+        rendered = html_report(report)
     else:
-        print(text_report(report, details=not args.quiet_details))
+        rendered = text_report(report, details=not args.quiet_details)
+    _write_output(args.output, rendered)
     return 0 if report.failed == 0 else 1
+
+
+def _write_output(path: Path | None, content: str) -> None:
+    if path is None:
+        print(content)
+    else:
+        path.write_text(content + ("\n" if not content.endswith("\n") else ""), encoding="utf-8")
 
 
 if __name__ == "__main__":
