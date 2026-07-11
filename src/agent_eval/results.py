@@ -83,6 +83,9 @@ def load_results(path: Path) -> dict[str, AgentResult]:
         notes = item.get("notes", "")
         if not isinstance(notes, str):
             raise ResultError(f"line {line_number}: 'notes' must be a string")
+        answer = item.get("answer")
+        if answer is not None and not isinstance(answer, str):
+            raise ResultError(f"line {line_number}: 'answer' must be a string")
         calls = _tool_calls(item.get("tool_calls"), line_number)
         tools = _list_of_strings(item.get("tools"), "tools", line_number)
         if "tools" not in item and calls:
@@ -95,6 +98,7 @@ def load_results(path: Path) -> dict[str, AgentResult]:
             actions=_list_of_strings(item.get("actions"), "actions", line_number),
             tool_calls=calls,
             events=_events(item.get("events"), line_number),
+            answer=answer,
             notes=notes,
         )
     return results

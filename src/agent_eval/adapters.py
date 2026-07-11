@@ -76,7 +76,7 @@ class PathMappingAdapter:
     """
 
     ALLOWED_FIELDS = {
-        "scenario", "intent", "asked", "tools", "actions", "tool_calls", "events", "notes"
+        "scenario", "intent", "asked", "tools", "actions", "tool_calls", "events", "answer", "notes"
     }
 
     def __init__(self, fields: dict[str, str]):
@@ -134,6 +134,9 @@ class PathMappingAdapter:
             notes = ""
         if not isinstance(notes, str):
             raise AdapterError(f"trace for scenario '{scenario}': notes must resolve to a string")
+        answer = values.get("answer")
+        if answer is not None and not isinstance(answer, str):
+            raise AdapterError(f"trace for scenario '{scenario}': answer must resolve to a string")
         events_value = values.get("events")
         events: list[TraceEvent] = []
         if events_value is not None:
@@ -157,6 +160,7 @@ class PathMappingAdapter:
             actions=_as_strings(values.get("actions"), "actions"),
             tool_calls=tuple(calls),
             events=tuple(events),
+            answer=answer,
             notes=notes,
         )
 
@@ -176,4 +180,5 @@ def result_as_dict(result: AgentResult) -> dict[str, Any]:
             {"type": event.event_type, "name": event.name} for event in result.events
         ],
         "notes": result.notes,
+        "answer": result.answer,
     }

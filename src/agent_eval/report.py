@@ -24,6 +24,7 @@ def text_report(report: EvaluationReport, *, details: bool = True) -> str:
         f"Tool accuracy:         {format_percent(report.tool_accuracy)}",
         f"Policy compliance:     {format_percent(report.policy_compliance)}",
         f"Unnecessary questions: {format_percent(report.unnecessary_question_rate)}",
+        f"Answer quality:        {format_percent(report.answer_quality_score)}",
     ]
     if details and report.failed:
         lines.extend(["", "Failures:"])
@@ -43,6 +44,9 @@ def text_report(report: EvaluationReport, *, details: bool = True) -> str:
                 reasons.append("policy violations: " + ", ".join(score.policy_violations))
             if score.notes:
                 reasons.append(score.notes)
+            for grade in score.answer_grades:
+                if not grade.passed:
+                    reasons.append(f"{grade.grader} grader: {grade.feedback or 'failed'}")
             lines.append(f"  - {score.scenario}: {'; '.join(reasons) or 'missing result'}")
     return "\n".join(lines)
 
@@ -59,6 +63,7 @@ def html_report(report: EvaluationReport) -> str:
             ("Tool accuracy", report.tool_accuracy),
             ("Policy compliance", report.policy_compliance),
             ("Unnecessary questions", report.unnecessary_question_rate),
+            ("Answer quality", report.answer_quality_score),
         )
     )
     scenario_rows = []
@@ -76,6 +81,9 @@ def html_report(report: EvaluationReport) -> str:
             failures.append("Policy violations: " + ", ".join(score.policy_violations))
         if score.notes:
             failures.append(score.notes)
+        for grade in score.answer_grades:
+            if not grade.passed:
+                failures.append(f"{grade.grader} grader: {grade.feedback or 'failed'}")
         outcome = "Passed" if score.passed else "Failed"
         reason = "; ".join(failures) if failures else "—"
         scenario_rows.append(
@@ -136,7 +144,8 @@ def repeated_html_report(report: dict) -> str:
         scenario_rows.append(
             f"<tr><th scope=\"row\">{escape(scenario['scenario'])}</th>"
             f"<td>{scenario['passed_runs']}/{scenario['total_runs']}</td>"
-            f"<td>{scenario['pass_rate'] * 100:.1f}%</td><td>{escape(failed_runs)}</td></tr>"
+            f"<td>{scenario['pass_rate'] * 100:.1f}% (Wilson {scenario['confidence_interval']['lower'] * 100:.1f}–{scenario['confidence_interval']['upper'] * 100:.1f}%)</td>"
+            f"<td>{escape(failed_runs)}</td></tr>"
         )
     return _document(
         "Agent Eval repeated-run report",
@@ -152,6 +161,7 @@ def repeated_html_report(report: dict) -> str:
             <div class="metric"><span>Mean pass rate</span><strong>{pass_stats['mean'] * 100:.1f}%</strong></div>
             <div class="metric"><span>Sample standard deviation</span><strong>{escape(format_percent(pass_stats['sample_stddev']))}</strong></div>
             <div class="metric"><span>Observed range</span><strong>{pass_stats['min'] * 100:.1f}%–{pass_stats['max'] * 100:.1f}%</strong></div>
+            <div class="metric"><span>{report['confidence'] * 100:.0f}% Wilson interval</span><strong>{pass_stats['confidence_interval']['lower'] * 100:.1f}%–{pass_stats['confidence_interval']['upper'] * 100:.1f}%</strong></div>
           </div>
         </section>
         <section aria-labelledby="metrics-heading">

@@ -1,7 +1,7 @@
 import unittest
 
 from agent_eval.models import EvaluationReport, ScenarioScore
-from agent_eval.repeated import analyze_repeated_runs
+from agent_eval.repeated import analyze_repeated_runs, wilson_interval
 
 
 def make_report(passed: bool) -> EvaluationReport:
@@ -33,6 +33,8 @@ class RepeatedRunTests(unittest.TestCase):
         self.assertAlmostEqual(result["pass_rate"]["sample_stddev"], 2**-0.5)
         self.assertEqual(result["scenarios"][0]["passed_runs"], 1)
         self.assertEqual(result["scenarios"][0]["failed_run_numbers"], [2])
+        self.assertGreater(result["pass_rate"]["confidence_interval"]["lower"], 0)
+        self.assertLess(result["pass_rate"]["confidence_interval"]["lower"], 0.5)
 
     def test_requires_at_least_two_runs(self):
         with self.assertRaisesRegex(ValueError, "at least two"):
@@ -57,3 +59,7 @@ class RepeatedRunTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "different scenario set"):
             analyze_repeated_runs([make_report(True), different])
 
+    def test_perfect_results_have_a_confidence_interval_below_one(self):
+        lower, upper = wilson_interval(6, 6)
+        self.assertAlmostEqual(lower, 0.6097, places=3)
+        self.assertEqual(upper, 1.0)

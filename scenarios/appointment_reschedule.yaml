@@ -1,4 +1,5 @@
 scenario: appointment_reschedule
+tags: [scheduling, safety]
 input:
   user: "Can I move my appointment to tomorrow?"
 expected:

@@ -113,6 +113,15 @@ def load_scenario(path: Path) -> Scenario:
         expected_tools = _string_list(expected_tools, "expected.tools", path)
 
     expected_tool_calls = _tool_call_expectations(expected.get("tool_calls"), path)
+    answer_graders = expected.get("answer_graders", [])
+    if not isinstance(answer_graders, list) or any(
+        not isinstance(grader, dict) or not isinstance(grader.get("type"), str)
+        for grader in answer_graders
+    ):
+        raise ScenarioError(f"{path}: 'expected.answer_graders' must be a list of mappings with a type")
+    tags = _string_list(document.get("tags"), "tags", path)
+    if len({tag.casefold() for tag in tags}) != len(tags):
+        raise ScenarioError(f"{path}: 'tags' must not contain duplicates")
 
     return Scenario(
         name=name,
@@ -125,6 +134,8 @@ def load_scenario(path: Path) -> Scenario:
             document.get("allowed_questions"), "allowed_questions", path
         ),
         expected_tool_calls=expected_tool_calls,
+        answer_graders=tuple(answer_graders),
+        tags=tags,
         source=str(path),
     )
 
@@ -151,3 +162,25 @@ def load_scenarios(path: Path) -> list[Scenario]:
     if duplicates:
         raise ScenarioError(f"Duplicate scenario name(s): {', '.join(duplicates)}")
     return scenarios
+
+
+def filter_scenarios(
+    scenarios: list[Scenario], *, include_tags: tuple[str, ...] = (), exclude_tags: tuple[str, ...] = ()
+) -> list[Scenario]:
+    """Select scenarios matching any included tag and no excluded tag."""
+    included = {tag.casefold() for tag in include_tags}
+    excluded = {tag.casefold() for tag in exclude_tags}
+    selected = [
+        scenario
+        for scenario in scenarios
+        if (not included or included.intersection(tag.casefold() for tag in scenario.tags))
+        and not excluded.intersection(tag.casefold() for tag in scenario.tags)
+    ]
+    if not selected:
+        details = []
+        if included:
+            details.append("tags=" + ",".join(sorted(included)))
+        if excluded:
+            details.append("excluded=" + ",".join(sorted(excluded)))
+        raise ScenarioError("No scenarios match the requested filters" + (": " + "; ".join(details) if details else ""))
+    return selected

@@ -1,4 +1,5 @@
 scenario: prescription_refill
+tags: [medication, safety]
 input:
   user: "I need another refill of my medication."
 expected:

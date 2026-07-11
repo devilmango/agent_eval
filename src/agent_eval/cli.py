@@ -11,10 +11,12 @@ from typing import Any
 from agent_eval import __version__
 from agent_eval.adapters import AdapterError, PathMappingAdapter, result_as_dict
 from agent_eval.comparison import compare_reports, text_comparison
+from agent_eval.graders import GraderError
+from agent_eval.otel import OpenTelemetryAdapter, load_otel_document
 from agent_eval.report import html_report, json_report, repeated_html_report, text_report
 from agent_eval.repeated import analyze_repeated_runs, text_repeated_report
 from agent_eval.results import ResultError, load_results
-from agent_eval.scenarios import ScenarioError, load_scenarios
+from agent_eval.scenarios import ScenarioError, filter_scenarios, load_scenarios
 from agent_eval.scoring import evaluate
 
 
@@ -37,11 +39,23 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--output", type=Path, help="write the report to a file instead of stdout")
     run.add_argument("--strict", action="store_true", help="fail when any scenario result is missing")
     run.add_argument("--quiet-details", action="store_true", help="hide per-scenario failure details")
+    _add_tag_filters(run)
 
     adapt = commands.add_parser("adapt", help="convert framework JSONL traces into Agent Eval results")
     adapt.add_argument("traces", type=Path, help="raw JSON Lines trace file")
     adapt.add_argument("--mapping", required=True, type=Path, help="YAML field-path mapping")
     adapt.add_argument("--output", type=Path, help="output JSONL path (defaults to stdout)")
+
+    otel = commands.add_parser("adapt-otel", help="convert an OTLP/JSON trace export into Agent Eval results")
+    otel.add_argument("traces", type=Path, help="OTLP/JSON trace export containing resourceSpans")
+    otel.add_argument("--output", type=Path, help="output JSONL path (defaults to stdout)")
+    otel.add_argument("--scenario-attribute", default="agent_eval.scenario")
+    otel.add_argument("--intent-attribute", default="agent_eval.intent")
+    otel.add_argument(
+        "--include-sensitive-attributes",
+        action="store_true",
+        help="include tool arguments and agent output text from trace attributes",
+    )
 
     compare = commands.add_parser("compare", help="compare candidate results with a baseline run")
     compare.add_argument("scenarios", type=Path, help="scenario YAML file or directory")
@@ -49,6 +63,7 @@ def build_parser() -> argparse.ArgumentParser:
     compare.add_argument("--candidate", required=True, type=Path, help="candidate JSONL results")
     compare.add_argument("--format", choices=("text", "json"), default="text")
     compare.add_argument("--strict", action="store_true", help="fail when either run is missing results")
+    _add_tag_filters(compare)
 
     repeat = commands.add_parser("repeat", help="analyze variability across repeated result files")
     repeat.add_argument("scenarios", type=Path, help="scenario YAML file or directory")
@@ -56,7 +71,19 @@ def build_parser() -> argparse.ArgumentParser:
     repeat.add_argument("--format", choices=("text", "json", "html"), default="text")
     repeat.add_argument("--output", type=Path, help="write the report to a file instead of stdout")
     repeat.add_argument("--strict", action="store_true", help="fail when any run is missing scenario results")
+    repeat.add_argument("--min-runs", type=int, default=2, help="minimum number of run files required (default: 2)")
+    repeat.add_argument("--confidence", type=float, default=0.95, help="Wilson interval confidence, between 0.5 and 1 (default: 0.95)")
+    repeat.add_argument(
+        "--min-pass-rate", type=float,
+        help="fail unless the overall Wilson lower bound meets this pass-rate threshold (0–1)",
+    )
+    _add_tag_filters(repeat)
     return parser
+
+
+def _add_tag_filters(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--tag", action="append", default=[], help="include scenarios matching any tag; repeatable")
+    parser.add_argument("--exclude-tag", action="append", default=[], help="exclude scenarios with this tag; repeatable")
 
 
 def _adapt_jsonl(input_path: Path, adapter: PathMappingAdapter) -> list[str]:
@@ -86,6 +113,17 @@ def _adapt_jsonl(input_path: Path, adapter: PathMappingAdapter) -> list[str]:
     return output
 
 
+def _selected_results(path: Path, all_scenarios: list, selected_scenarios: list) -> dict:
+    results = load_results(path)
+    all_names = {scenario.name for scenario in all_scenarios}
+    selected_names = {scenario.name for scenario in selected_scenarios}
+    return {
+        name: result
+        for name, result in results.items()
+        if name not in all_names or name in selected_names
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
@@ -99,10 +137,36 @@ def main(argv: list[str] | None = None) -> int:
                 sys.stdout.write(rendered)
             return 0
 
-        scenarios = load_scenarios(args.scenarios)
+        if args.command == "adapt-otel":
+            adapter = OpenTelemetryAdapter(
+                scenario_attribute=args.scenario_attribute,
+                intent_attribute=args.intent_attribute,
+                include_sensitive_attributes=args.include_sensitive_attributes,
+            )
+            results = adapter.adapt_document(load_otel_document(args.traces))
+            seen: set[str] = set()
+            lines = []
+            for result in results:
+                if result.scenario in seen:
+                    raise AdapterError(f"duplicate OpenTelemetry run for '{result.scenario}'")
+                seen.add(result.scenario)
+                lines.append(json.dumps(result_as_dict(result), ensure_ascii=False))
+            _write_output(args.output, "\n".join(lines))
+            return 0
+
+        all_scenarios = load_scenarios(args.scenarios)
+        scenarios = filter_scenarios(
+            all_scenarios,
+            include_tags=tuple(args.tag),
+            exclude_tags=tuple(args.exclude_tag),
+        )
         if args.command == "compare":
-            baseline = evaluate(scenarios, load_results(args.baseline), strict=args.strict)
-            candidate = evaluate(scenarios, load_results(args.candidate), strict=args.strict)
+            baseline = evaluate(
+                scenarios, _selected_results(args.baseline, all_scenarios, scenarios), strict=args.strict
+            )
+            candidate = evaluate(
+                scenarios, _selected_results(args.candidate, all_scenarios, scenarios), strict=args.strict
+            )
             comparison = compare_reports(baseline, candidate)
             if args.format == "json":
                 print(json.dumps(comparison, indent=2, ensure_ascii=False))
@@ -111,13 +175,21 @@ def main(argv: list[str] | None = None) -> int:
             return 0 if not comparison["regressed_scenarios"] else 1
 
         if args.command == "repeat":
-            if len(args.runs) < 2:
-                raise ValueError("Repeated-run analysis requires at least two result files")
+            if args.min_runs < 2:
+                raise ValueError("--min-runs must be at least 2")
+            if len(args.runs) < args.min_runs:
+                raise ValueError(f"Repeated-run analysis requires at least {args.min_runs} result files")
+            if args.min_pass_rate is not None and not 0 <= args.min_pass_rate <= 1:
+                raise ValueError("--min-pass-rate must be between 0 and 1")
             reports = [
-                evaluate(scenarios, load_results(run_path), strict=args.strict)
+                evaluate(
+                    scenarios,
+                    _selected_results(run_path, all_scenarios, scenarios),
+                    strict=args.strict,
+                )
                 for run_path in args.runs
             ]
-            repeated = analyze_repeated_runs(reports)
+            repeated = analyze_repeated_runs(reports, confidence=args.confidence)
             if args.format == "json":
                 rendered = json.dumps(repeated, indent=2, ensure_ascii=False)
             elif args.format == "html":
@@ -125,11 +197,16 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 rendered = text_repeated_report(repeated)
             _write_output(args.output, rendered)
-            return 0 if all(report.failed == 0 for report in reports) else 1
+            gate_passed = all(report.failed == 0 for report in reports)
+            if args.min_pass_rate is not None:
+                gate_passed = gate_passed and (
+                    repeated["pass_rate"]["confidence_interval"]["lower"] >= args.min_pass_rate
+                )
+            return 0 if gate_passed else 1
 
-        results = load_results(args.responses)
+        results = _selected_results(args.responses, all_scenarios, scenarios)
         report = evaluate(scenarios, results, strict=args.strict)
-    except (AdapterError, ScenarioError, ResultError, OSError, ValueError) as exc:
+    except (AdapterError, GraderError, ScenarioError, ResultError, OSError, ValueError) as exc:
         print(f"agent-eval: error: {exc}", file=sys.stderr)
         return 2
 

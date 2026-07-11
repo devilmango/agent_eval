@@ -1,3 +1,3 @@
 {"scenario":"appointment_reschedule","intent":"RESCHEDULE","asked":["patient_identity"],"tools":["lookup_appointment"],"tool_calls":[{"name":"lookup_appointment","arguments":{"patient_id":"demo-patient","requested_date":"tomorrow"}}],"actions":[]}
 {"scenario":"prescription_refill","intent":"REFILL_REQUEST","asked":["patient_identity","medication_name"],"tools":["check_refill_eligibility"],"actions":[]}
-{"scenario":"clinic_hours","intent":"OFFICE_HOURS","asked":[],"tools":["lookup_clinic_hours"],"actions":[]}
+{"scenario":"clinic_hours","intent":"OFFICE_HOURS","asked":[],"tools":["lookup_clinic_hours"],"actions":[],"answer":"The clinic closes at 5 PM today."}

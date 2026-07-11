@@ -110,6 +110,7 @@ must_not:
   - cancel_without_confirmation
 allowed_questions:
   - appointment_date
+tags: [scheduling, safety]
 ```
 
 ### Scenario fields
@@ -124,6 +125,8 @@ allowed_questions:
 | `expected.tool_calls` | No | Exact ordered tool-call sequence, with optional argument matchers for each call. |
 | `must_not` | No | Action identifiers that must not appear in the recorded actions. |
 | `allowed_questions` | No | Additional question identifiers permitted for this scenario. |
+| `expected.answer_graders` | No | Deterministic checks or installed grader plugins applied to the agent's final answer. |
+| `tags` | No | Labels for selecting related scenarios from the CLI. |
 
 Question, tool, and action names are identifiers agreed on by your adapter and scenario files. Tool order doesn't matter; an extra or missing tool makes the tool check fail. Identifiers are compared without letter case or surrounding whitespace.
 
@@ -179,6 +182,7 @@ Write one JSON object per line. Each `scenario` must match one scenario ID.
 | `tool_calls` | No | Ordered tool calls as objects with `name` and an `arguments` mapping. This can supply the tool list when `tools` is omitted. |
 | `actions` | No | Action identifiers checked against the scenario's `must_not` list. |
 | `events` | No | Ordered `{type, name}` records, where type is `question` or `action`. Needed to verify that conditional policy prerequisites happened before an action. |
+| `answer` | No | Final answer text used only when the scenario declares answer graders. |
 | `notes` | No | Optional diagnostic text displayed with a failing scenario. |
 
 An adapter can capture results from an agent trace, tool middleware, or your application's own structured response. Keep the result file free of real patient information, credentials, and other sensitive data—scenario identifiers and behavior labels are enough for scoring.
@@ -221,6 +225,57 @@ agent-eval repeat scenarios/ \
 
 Agent Eval analyzes supplied result files; it does not launch the agent or choose a model sampling configuration. The report includes each metric's mean, sample standard deviation, and observed range, plus per-scenario pass frequency and the run numbers that failed. `repeat` requires at least two runs and exits `1` if any run has failed scenarios.
 
+Repeated-run reports also include Wilson score confidence intervals for the overall and per-scenario pass rates. Gate a release on the lower confidence bound with `--min-pass-rate`; the gate fails if the lower bound is below the requested threshold, even when the observed pass rate is higher. Set `--confidence` (default `0.95`) to a value between `0.5` and `1`, and `--min-runs` (default `2`) to require a minimum number of captures:
+
+```bash
+agent-eval repeat scenarios/ --runs runs/*.jsonl \
+  --min-runs 10 --confidence 0.95 --min-pass-rate 0.98 --strict
+```
+
+The interval measures uncertainty in the aggregate scenario pass proportion, assuming each scenario result is a Bernoulli outcome. It does not correct for correlated runs, scenario selection bias, or incomplete scenario coverage. Choose a run count and threshold appropriate to the risk; a small sample can have a wide interval even with no observed failures.
+
+### Filter by scenario tags
+
+Add a `tags` list at the scenario's top level, then pass one or more `--tag` and `--exclude-tag` options to `run`, `compare`, or `repeat`. Inclusion uses OR semantics (a scenario matching any included tag is selected); exclusions always take precedence. Matching ignores case.
+
+```bash
+agent-eval run scenarios/ --responses run.jsonl --tag safety --tag medication --exclude-tag faq
+```
+
+Tags help run focused suites while preserving the same scenario definitions. A filtered run still rejects unknown result IDs and ignores result rows for scenarios outside the selected set.
+
+### Grade answer quality
+
+Answer graders are opt-in. Add grader specifications under `expected.answer_graders` and store the final answer as the optional `answer` string in each result. Every configured grader must pass for its scenario to pass; the report also includes the mean grader score as `answer_quality_score`.
+
+```yaml
+expected:
+  intent: OFFICE_HOURS
+  answer_graders:
+    - type: contains_any
+      values: ["5 PM", "17:00"]
+      name: includes_closing_time
+    - type: not_contains
+      values: ["patient record"]
+```
+
+Built-in grader types are `contains_any`, `contains_all`, `not_contains`, `min_length`, and `max_length`. Text graders accept `case_sensitive` (default `false`); `contains_any` and `contains_all` can accept a `threshold` from 0 to 1. Length graders take a non-negative integer `value`. These are deterministic checks, not semantic truth or clinical safety assessments.
+
+Custom graders can be installed as Python entry points in the `agent_eval.graders` group. Each entry-point name is the scenario's `type`; its loaded class/factory/object must expose `grade(answer: str, config: Mapping[str, Any]) -> GradeResult`. The `GradeResult` contains a normalized `score` from 0 to 1, `passed`, optional `feedback`, and optional `metadata`. Grader packages run in-process and should be treated as trusted code.
+
+### Ingest OpenTelemetry traces
+
+Convert an OTLP/JSON trace export into the canonical JSONL result format:
+
+```bash
+agent-eval adapt-otel otel-traces.json --output results.jsonl
+agent-eval run scenarios/ --responses results.jsonl --strict
+```
+
+The adapter groups spans by trace ID, identifies agent invocations and tool spans through the GenAI semantic convention attributes, and reads scenario and intent from `agent_eval.scenario` and `agent_eval.intent` by default. Override those attribute names with `--scenario-attribute` and `--intent-attribute`. Emit `agent_eval.event.type` (`question` or `action`) and `agent_eval.event.name` on spans or span events to capture ordered policy events.
+
+Trace content can contain sensitive data. The adapter omits tool arguments and generated answer text by default. `--include-sensitive-attributes` opts in to extracting `gen_ai.tool.call.arguments`, `gen_ai.output.messages`, or the custom `agent_eval.answer` attribute; review and sanitize trace exports before storing or sharing result files.
+
 Create a standalone, shareable HTML report for one run or repeated-run analysis:
 
 ```bash
@@ -257,7 +312,7 @@ The included [GitHub Actions workflow](.github/workflows/ci.yml) runs the unit s
 | Unnecessary questions | Asked identifiers that are neither required nor allowed ÷ all recorded questions. Displays 0% when the agent asked no questions. |
 | Scenario pass rate | Scenarios passing intent, required-question, unnecessary-question, declared tool, and prohibited-action checks ÷ all scenarios. |
 
-A scenario fails if the intent is wrong, a required question is missing, an unnecessary question was asked, a declared tool set doesn't match, or a prohibited action appears in the trace. Policy checks look for exact action identifiers; they don't interpret free-form text or decide whether an action was safe in context.
+A scenario fails if the intent is wrong, a required question is missing, an unnecessary question was asked, a declared tool set doesn't match, a prohibited action appears in the trace, or any configured answer grader fails. Policy checks look for exact action identifiers; they don't interpret free-form text or decide whether an action was safe in context.
 
 ## Project structure
 
@@ -274,7 +329,7 @@ agent_eval/
 
 ## Current scope
 
-Agent Eval is an early, local-first harness. It evaluates recorded structured traces, uses exact identifier matching, and produces aggregate metrics plus scenario-level failure details. It does not execute agents, grade natural-language answer quality, estimate statistical confidence, or guarantee that a scenario collection covers every production risk. Treat the score as evidence about the scenarios you wrote, and expand the suite as you learn about real user behavior and failure modes.
+Agent Eval is an early, local-first harness. It evaluates recorded structured traces, uses exact identifier matching, and produces aggregate metrics plus scenario-level failure details. It does not execute agents or guarantee that a scenario collection covers every production risk. Built-in answer graders are simple deterministic checks, and confidence intervals assume independent Bernoulli outcomes. Treat scores as evidence about the scenarios and captures you supplied, and expand the suite as you learn about real user behavior and failure modes.
 
 ## Next ideas
 

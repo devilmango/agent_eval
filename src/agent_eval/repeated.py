@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from statistics import mean, stdev
+from statistics import NormalDist, mean, stdev
 from typing import Any
 
 from agent_eval.models import EvaluationReport
@@ -13,6 +13,7 @@ METRICS = (
     "tool_accuracy",
     "policy_compliance",
     "unnecessary_question_rate",
+    "answer_quality_score",
 )
 
 
@@ -25,7 +26,24 @@ def _statistics(values: list[float]) -> dict[str, float | None]:
     }
 
 
-def analyze_repeated_runs(reports: list[EvaluationReport]) -> dict[str, Any]:
+def wilson_interval(successes: int, trials: int, confidence: float = 0.95) -> tuple[float, float]:
+    """Return a two-sided Wilson score interval for a binomial proportion."""
+    if trials < 1 or not 0 <= successes <= trials:
+        raise ValueError("Wilson interval requires 0 <= successes <= trials and trials >= 1")
+    if not 0.5 < confidence < 1:
+        raise ValueError("confidence must be greater than 0.5 and less than 1")
+    z = NormalDist().inv_cdf(0.5 + confidence / 2)
+    proportion = successes / trials
+    denominator = 1 + z * z / trials
+    center = (proportion + z * z / (2 * trials)) / denominator
+    variance = proportion * (1 - proportion) / trials + z * z / (4 * trials * trials)
+    margin = z * variance**0.5 / denominator
+    return max(0.0, center - margin), min(1.0, center + margin)
+
+
+def analyze_repeated_runs(
+    reports: list[EvaluationReport], *, confidence: float = 0.95
+) -> dict[str, Any]:
     if len(reports) < 2:
         raise ValueError("Repeated-run analysis requires at least two evaluation runs")
 
@@ -36,7 +54,12 @@ def analyze_repeated_runs(reports: list[EvaluationReport]) -> dict[str, Any]:
         if names != expected_names:
             raise ValueError(f"Run {index} has a different scenario set")
 
+    if not 0.5 < confidence < 1:
+        raise ValueError("confidence must be greater than 0.5 and less than 1")
     pass_rates = [report.passed / report.total if report.total else 0.0 for report in reports]
+    successes = sum(report.passed for report in reports)
+    trials = sum(report.total for report in reports)
+    lower, upper = wilson_interval(successes, trials, confidence) if trials else (0.0, 1.0)
     metrics: dict[str, dict[str, float | None]] = {}
     for metric in METRICS:
         values = [getattr(report, metric) for report in reports]
@@ -52,12 +75,17 @@ def analyze_repeated_runs(reports: list[EvaluationReport]) -> dict[str, Any]:
             for report in reports
         ]
         passed = sum(outcomes)
+        scenario_lower, scenario_upper = wilson_interval(passed, len(outcomes), confidence)
         scenario_rows.append(
             {
                 "scenario": name,
                 "passed_runs": passed,
                 "total_runs": len(outcomes),
                 "pass_rate": passed / len(outcomes),
+                "confidence_interval": {
+                    "lower": scenario_lower,
+                    "upper": scenario_upper,
+                },
                 "failed_run_numbers": [index for index, outcome in enumerate(outcomes, start=1) if not outcome],
             }
         )
@@ -65,7 +93,8 @@ def analyze_repeated_runs(reports: list[EvaluationReport]) -> dict[str, Any]:
     return {
         "runs": len(reports),
         "scenario_count": len(scenario_names),
-        "pass_rate": _statistics(pass_rates),
+        "confidence": confidence,
+        "pass_rate": {**_statistics(pass_rates), "confidence_interval": {"lower": lower, "upper": upper}},
         "run_pass_rates": pass_rates,
         "metrics": metrics,
         "scenarios": scenario_rows,
@@ -80,6 +109,9 @@ def text_repeated_report(report: dict[str, Any]) -> str:
         f"Pass rate mean: {pass_stats['mean'] * 100:.1f}%",
         f"Pass rate sample stddev: {_percent_or_na(pass_stats['sample_stddev'])}",
         f"Pass rate range: {pass_stats['min'] * 100:.1f}%–{pass_stats['max'] * 100:.1f}%",
+        f"Pass rate {report['confidence'] * 100:.0f}% Wilson interval: "
+        f"{pass_stats['confidence_interval']['lower'] * 100:.1f}%–"
+        f"{pass_stats['confidence_interval']['upper'] * 100:.1f}%",
         "",
         "Metric variability (mean ± sample stddev):",
     ]
@@ -94,11 +126,12 @@ def text_repeated_report(report: dict[str, Any]) -> str:
     for scenario in report["scenarios"]:
         lines.append(
             f"  {scenario['scenario']}: {scenario['passed_runs']}/{scenario['total_runs']} "
-            f"({scenario['pass_rate'] * 100:.1f}%)"
+            f"({scenario['pass_rate'] * 100:.1f}%; Wilson "
+            f"{scenario['confidence_interval']['lower'] * 100:.1f}–"
+            f"{scenario['confidence_interval']['upper'] * 100:.1f}%)"
         )
     return "\n".join(lines)
 
 
 def _percent_or_na(value: float | None) -> str:
     return "n/a" if value is None else f"{value * 100:.1f}%"
-

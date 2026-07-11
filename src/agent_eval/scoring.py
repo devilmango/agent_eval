@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from statistics import mean
 
-from agent_eval.models import AgentResult, EvaluationReport, Scenario, ScenarioScore, ToolCallExpectation
+from agent_eval.graders import AnswerGrader, grade_answer, load_grader_registry
+from agent_eval.models import AgentResult, EvaluationReport, GradeResult, Scenario, ScenarioScore, ToolCallExpectation
 from agent_eval.results import ResultError
 
 
@@ -93,7 +95,11 @@ def _missing_policy_prerequisites(result: AgentResult, action: str, required: tu
     return missing
 
 
-def score_scenario(scenario: Scenario, result: AgentResult) -> ScenarioScore:
+def score_scenario(
+    scenario: Scenario,
+    result: AgentResult,
+    grader_registry: dict[str, AnswerGrader] | None = None,
+) -> ScenarioScore:
     intent_correct = scenario.intent.strip().casefold() == result.intent.strip().casefold()
     asked = _normalized(result.asked)
     required = _normalized(scenario.must_ask)
@@ -133,12 +139,19 @@ def score_scenario(scenario: Scenario, result: AgentResult) -> ScenarioScore:
             suffix = f" (unless asked: {', '.join(missing_prerequisites)})" if missing_prerequisites else ""
             violations.append(rule.action + suffix)
 
+    answer_grades = grade_answer(
+        scenario,
+        result,
+        grader_registry if grader_registry is not None else load_grader_registry(),
+    ) if scenario.answer_graders else ()
+
     passed = (
         intent_correct
         and not missing
         and not violations
         and not unnecessary
         and tool_correct is not False
+        and all(grade.passed for grade in answer_grades)
     )
     return ScenarioScore(
         scenario=scenario.name,
@@ -153,6 +166,7 @@ def score_scenario(scenario: Scenario, result: AgentResult) -> ScenarioScore:
         tool_call_mismatches=tool_mismatches,
         tool_correct=tool_correct,
         policy_violations=tuple(violations),
+        answer_grades=answer_grades,
         notes=result.notes,
     )
 
@@ -167,6 +181,12 @@ def evaluate(
         raise ResultError(f"Results contain unknown scenario(s): {', '.join(unknown)}")
     if missing_results and strict:
         raise ResultError(f"Results are missing scenario(s): {', '.join(missing_results)}")
+
+    grader_registry = (
+        load_grader_registry()
+        if any(scenario.answer_graders for scenario in scenarios)
+        else {}
+    )
 
     scores: list[ScenarioScore] = []
     for scenario in scenarios:
@@ -190,10 +210,20 @@ def evaluate(
                     if scenario.expected_tool_calls is not None
                     else (),
                     notes="No agent result was provided.",
+                    answer_grades=tuple(
+                        GradeResult(
+                            grader=spec["type"],
+                            score=0.0,
+                            passed=False,
+                            feedback="No agent result was provided.",
+                            rubric=dict(spec),
+                        )
+                        for spec in scenario.answer_graders
+                    ),
                 )
             )
         else:
-            scores.append(score_scenario(scenario, result))
+            scores.append(score_scenario(scenario, result, grader_registry))
 
     total = len(scores)
     passed = sum(score.passed for score in scores)
@@ -203,6 +233,7 @@ def evaluate(
     violations = sum(len(score.policy_violations) for score in scores)
     asked_count = sum(len(result.asked) for result in results.values())
     unnecessary_count = sum(len(score.unnecessary_questions) for score in scores)
+    answer_scores = [grade.score for score in scores for grade in score.answer_grades]
 
     return EvaluationReport(
         total=total,
@@ -216,5 +247,6 @@ def evaluate(
         unnecessary_question_rate=(
             unnecessary_count / asked_count if asked_count else 0.0
         ),
+        answer_quality_score=mean(answer_scores) if answer_scores else None,
         scores=tuple(scores),
     )

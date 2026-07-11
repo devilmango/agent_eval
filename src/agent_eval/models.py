@@ -25,6 +25,16 @@ class TraceEvent:
 
 
 @dataclass(frozen=True)
+class GradeResult:
+    grader: str
+    score: float
+    passed: bool
+    feedback: str = ""
+    rubric: dict[str, Any] = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class PolicyRule:
     action: str
     unless_asked: tuple[str, ...] = ()
@@ -40,6 +50,8 @@ class Scenario:
     must_not: tuple[PolicyRule, ...] = ()
     allowed_questions: tuple[str, ...] = ()
     expected_tool_calls: tuple[ToolCallExpectation, ...] | None = None
+    answer_graders: tuple[dict[str, Any], ...] = ()
+    tags: tuple[str, ...] = ()
     source: str = ""
 
 
@@ -52,6 +64,7 @@ class AgentResult:
     actions: tuple[str, ...] = ()
     tool_calls: tuple[ToolCall, ...] = ()
     events: tuple[TraceEvent, ...] = ()
+    answer: str | None = None
     notes: str = ""
 
 
@@ -69,6 +82,7 @@ class ScenarioScore:
     tool_call_mismatches: tuple[str, ...] = ()
     tool_correct: bool | None = None
     policy_violations: tuple[str, ...] = ()
+    answer_grades: tuple[GradeResult, ...] = ()
     notes: str = ""
 
     def as_dict(self) -> dict[str, Any]:
@@ -84,6 +98,7 @@ class EvaluationReport:
     tool_accuracy: float | None
     policy_compliance: float
     unnecessary_question_rate: float
+    answer_quality_score: float | None = None
     scores: tuple[ScenarioScore, ...] = field(default_factory=tuple)
 
     def as_dict(self) -> dict[str, Any]:
@@ -96,6 +111,7 @@ class EvaluationReport:
                 "tool_accuracy": self.tool_accuracy,
                 "policy_compliance": self.policy_compliance,
                 "unnecessary_question_rate": self.unnecessary_question_rate,
+                "answer_quality_score": self.answer_quality_score,
             },
             "scenarios": [score.as_dict() for score in self.scores],
         }

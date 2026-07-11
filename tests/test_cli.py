@@ -43,6 +43,51 @@ class CliTests(unittest.TestCase):
             )
         self.assertEqual(status, 0)
 
+    def test_run_command_filters_scenarios_by_tag(self):
+        output = StringIO()
+        with redirect_stdout(output):
+            status = main([
+                "run", str(ROOT / "scenarios"), "--responses", str(ROOT / "examples/responses.jsonl"),
+                "--tag", "faq",
+            ])
+        self.assertEqual(status, 0)
+        self.assertIn("1 scenarios", output.getvalue())
+
+    def test_repeat_command_enforces_confidence_aware_pass_rate_gate(self):
+        with redirect_stdout(StringIO()):
+            passing = main([
+                "repeat", str(ROOT / "scenarios"), "--runs",
+                str(ROOT / "examples/responses.jsonl"), str(ROOT / "examples/responses.jsonl"),
+                "--min-runs", "2", "--min-pass-rate", "0.60",
+            ])
+            failing = main([
+                "repeat", str(ROOT / "scenarios"), "--runs",
+                str(ROOT / "examples/responses.jsonl"), str(ROOT / "examples/responses.jsonl"),
+                "--min-pass-rate", "0.99",
+            ])
+        self.assertEqual(passing, 0)
+        self.assertEqual(failing, 1)
+
+    def test_adapt_otel_command_writes_canonical_result(self):
+        document = {
+            "resourceSpans": [{"scopeSpans": [{"spans": [{
+                "traceId": "t", "spanId": "s", "name": "agent",
+                "attributes": [
+                    {"key": "gen_ai.operation.name", "value": {"stringValue": "invoke_agent"}},
+                    {"key": "agent_eval.scenario", "value": {"stringValue": "booking"}},
+                    {"key": "agent_eval.intent", "value": {"stringValue": "BOOK"}},
+                ],
+            }]}]}],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "trace.json"
+            target = Path(directory) / "results.jsonl"
+            source.write_text(json.dumps(document), encoding="utf-8")
+            status = main(["adapt-otel", str(source), "--output", str(target)])
+            result = json.loads(target.read_text(encoding="utf-8"))
+        self.assertEqual(status, 0)
+        self.assertEqual((result["scenario"], result["intent"]), ("booking", "BOOK"))
+
     def test_compare_command_finds_improvement(self):
         with redirect_stdout(StringIO()):
             status = main(

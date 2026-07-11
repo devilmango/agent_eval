@@ -32,6 +32,7 @@ def compare_reports(baseline: EvaluationReport, candidate: EvaluationReport) -> 
         "tool_accuracy",
         "policy_compliance",
         "unnecessary_question_rate",
+        "answer_quality_score",
     )
     deltas: dict[str, float | None] = {}
     for metric in metrics:

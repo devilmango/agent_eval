@@ -1,10 +1,14 @@
 scenario: clinic_hours
+tags: [faq]
 input:
   user: "What time does the clinic close today?"
 expected:
   intent: OFFICE_HOURS
   tools:
     - lookup_clinic_hours
+  answer_graders:
+    - type: contains_any
+      values: ["5 PM", "17:00"]
+      name: includes_closing_time
 must_not:
   - disclose_patient_information
-

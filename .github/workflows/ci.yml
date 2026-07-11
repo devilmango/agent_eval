@@ -21,10 +21,14 @@ jobs:
         run: python -m unittest discover -s tests -v
       - name: Validate sample run and create HTML report
         run: agent-eval run scenarios/ --responses examples/responses.jsonl --strict --format html --output agent-eval-report.html
+      - name: Check repeated-run confidence gate
+        run: agent-eval repeat scenarios/ --runs examples/responses.jsonl examples/responses.jsonl --min-runs 2 --confidence 0.95 --min-pass-rate 0.60 --strict --format html --output agent-eval-stability.html
       - name: Upload evaluation report
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: agent-eval-report-python-${{ matrix.python-version }}
-          path: agent-eval-report.html
+          path: |
+            agent-eval-report.html
+            agent-eval-stability.html
           if-no-files-found: ignore
