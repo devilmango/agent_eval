@@ -7,7 +7,7 @@ from typing import Any
 
 import yaml
 
-from agent_eval.models import PolicyRule, Scenario, ToolCallExpectation
+from agent_eval.models import PolicyRule, Scenario, ScenarioTurn, ToolCallExpectation
 
 
 class ScenarioError(ValueError):
@@ -100,13 +100,44 @@ def load_scenario(path: Path) -> Scenario:
 
     name = document.get("scenario")
     user_input = document.get("input")
+    raw_turns = document.get("turns")
     expected = document.get("expected", {})
     if not isinstance(name, str) or not name.strip():
         raise ScenarioError(f"{path}: 'scenario' must be a non-empty string")
-    if not isinstance(user_input, dict) or not user_input:
-        raise ScenarioError(f"{path}: 'input' must be a non-empty mapping")
     if not isinstance(expected, dict) or not isinstance(expected.get("intent"), str):
         raise ScenarioError(f"{path}: 'expected.intent' must be a string")
+
+    turns: list[ScenarioTurn] = []
+    if raw_turns is not None:
+        if user_input is not None:
+            raise ScenarioError(f"{path}: use either 'input' or 'turns', not both")
+        if not isinstance(raw_turns, list) or not raw_turns:
+            raise ScenarioError(f"{path}: 'turns' must be a non-empty list")
+        for index, raw_turn in enumerate(raw_turns):
+            label = f"turns[{index}]"
+            if not isinstance(raw_turn, dict) or not isinstance(raw_turn.get("input"), dict) or not raw_turn["input"]:
+                raise ScenarioError(f"{path}: '{label}.input' must be a non-empty mapping")
+            turn_expected = raw_turn.get("expected", {})
+            if not isinstance(turn_expected, dict):
+                raise ScenarioError(f"{path}: '{label}.expected' must be a mapping")
+            turn_intent = turn_expected.get("intent")
+            if turn_intent is not None and not isinstance(turn_intent, str):
+                raise ScenarioError(f"{path}: '{label}.expected.intent' must be a string")
+            turn_tools = turn_expected.get("tools")
+            if turn_tools is not None:
+                turn_tools = _string_list(turn_tools, f"{label}.expected.tools", path)
+            turns.append(ScenarioTurn(
+                input=raw_turn["input"],
+                intent=turn_intent,
+                must_ask=_string_list(turn_expected.get("must_ask"), f"{label}.expected.must_ask", path),
+                expected_tools=turn_tools,
+                must_not=_policy_rules(raw_turn.get("must_not"), path),
+                allowed_questions=_string_list(raw_turn.get("allowed_questions"), f"{label}.allowed_questions", path),
+                expected_tool_calls=_tool_call_expectations(turn_expected.get("tool_calls"), path),
+            ))
+        user_input = turns[0].input
+    elif not isinstance(user_input, dict) or not user_input:
+        raise ScenarioError(f"{path}: 'input' must be a non-empty mapping when 'turns' is omitted")
 
     expected_tools = expected.get("tools")
     if expected_tools is not None:
@@ -137,6 +168,7 @@ def load_scenario(path: Path) -> Scenario:
         answer_graders=tuple(answer_graders),
         tags=tags,
         source=str(path),
+        turns=tuple(turns),
     )
 
 

@@ -9,13 +9,16 @@ from pathlib import Path
 from typing import Any
 
 from agent_eval import __version__
-from agent_eval.adapters import AdapterError, PathMappingAdapter, result_as_dict
+from agent_eval.adapters import AdapterError, PathMappingAdapter, load_adapter_plugin, result_as_dict
 from agent_eval.comparison import compare_reports, text_comparison
 from agent_eval.graders import GraderError
+from agent_eval.models import AgentResult
 from agent_eval.otel import OpenTelemetryAdapter, load_otel_document
+from agent_eval.quality import mutation_report, scenario_coverage, text_coverage, text_mutation_report
 from agent_eval.report import html_report, json_report, repeated_html_report, text_report
 from agent_eval.repeated import analyze_repeated_runs, text_repeated_report
 from agent_eval.results import ResultError, load_results
+from agent_eval.runner import RunnerError, execute_scenarios, load_runner
 from agent_eval.scenarios import ScenarioError, filter_scenarios, load_scenarios
 from agent_eval.scoring import evaluate
 
@@ -45,6 +48,11 @@ def build_parser() -> argparse.ArgumentParser:
     adapt.add_argument("traces", type=Path, help="raw JSON Lines trace file")
     adapt.add_argument("--mapping", required=True, type=Path, help="YAML field-path mapping")
     adapt.add_argument("--output", type=Path, help="output JSONL path (defaults to stdout)")
+
+    framework = commands.add_parser("adapt-framework", help="convert traces with an installed framework adapter")
+    framework.add_argument("adapter", help="adapter entry-point name")
+    framework.add_argument("traces", type=Path, help="framework trace JSON Lines file")
+    framework.add_argument("--output", type=Path, help="output JSONL path (defaults to stdout)")
 
     otel = commands.add_parser("adapt-otel", help="convert an OTLP/JSON trace export into Agent Eval results")
     otel.add_argument("traces", type=Path, help="OTLP/JSON trace export containing resourceSpans")
@@ -78,6 +86,26 @@ def build_parser() -> argparse.ArgumentParser:
         help="fail unless the overall Wilson lower bound meets this pass-rate threshold (0–1)",
     )
     _add_tag_filters(repeat)
+
+    run_agent = commands.add_parser("run-agent", help="execute scenarios through an installed agent runner")
+    run_agent.add_argument("scenarios", type=Path, help="scenario YAML file or directory")
+    run_agent.add_argument("--runner", required=True, help="runner entry-point name")
+    run_agent.add_argument("--results", required=True, type=Path, help="write captured canonical JSONL results here")
+    run_agent.add_argument("--report", type=Path, help="write evaluation report here (defaults to stdout)")
+    run_agent.add_argument("--format", choices=("text", "json", "html"), default="text")
+    _add_tag_filters(run_agent)
+
+    coverage = commands.add_parser("coverage", help="summarize behavior dimensions declared by scenarios")
+    coverage.add_argument("scenarios", type=Path, help="scenario YAML file or directory")
+    coverage.add_argument("--format", choices=("text", "json"), default="text")
+    coverage.add_argument("--output", type=Path, help="write the report to a file instead of stdout")
+
+    mutate = commands.add_parser("mutate", help="check whether scenarios catch representative trace regressions")
+    mutate.add_argument("scenarios", type=Path, help="scenario YAML file or directory")
+    mutate.add_argument("--responses", required=True, type=Path, help="canonical JSONL agent results")
+    mutate.add_argument("--format", choices=("text", "json"), default="text")
+    mutate.add_argument("--output", type=Path, help="write the report to a file instead of stdout")
+    _add_tag_filters(mutate)
     return parser
 
 
@@ -104,8 +132,10 @@ def _adapt_jsonl(input_path: Path, adapter: PathMappingAdapter) -> list[str]:
             raise AdapterError(f"line {number}: each trace record must be a JSON object")
         try:
             result = adapter.adapt(record)
-        except AdapterError as exc:
+        except Exception as exc:
             raise AdapterError(f"line {number}: {exc}") from exc
+        if not isinstance(result, AgentResult):
+            raise AdapterError(f"line {number}: adapter must return an AgentResult")
         if result.scenario in seen_scenarios:
             raise AdapterError(f"line {number}: duplicate trace for '{result.scenario}'")
         seen_scenarios.add(result.scenario)
@@ -137,6 +167,12 @@ def main(argv: list[str] | None = None) -> int:
                 sys.stdout.write(rendered)
             return 0
 
+        if args.command == "adapt-framework":
+            adapter = load_adapter_plugin(args.adapter)
+            output = _adapt_jsonl(args.traces, adapter)
+            _write_output(args.output, "\n".join(output))
+            return 0
+
         if args.command == "adapt-otel":
             adapter = OpenTelemetryAdapter(
                 scenario_attribute=args.scenario_attribute,
@@ -155,6 +191,11 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         all_scenarios = load_scenarios(args.scenarios)
+        if args.command == "coverage":
+            report = scenario_coverage(all_scenarios)
+            rendered = json.dumps(report, indent=2, ensure_ascii=False) if args.format == "json" else text_coverage(report)
+            _write_output(args.output, rendered)
+            return 0
         scenarios = filter_scenarios(
             all_scenarios,
             include_tags=tuple(args.tag),
@@ -173,6 +214,12 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 print(text_comparison(comparison))
             return 0 if not comparison["regressed_scenarios"] else 1
+
+        if args.command == "mutate":
+            report = mutation_report(scenarios, _selected_results(args.responses, all_scenarios, scenarios))
+            rendered = json.dumps(report, indent=2, ensure_ascii=False) if args.format == "json" else text_mutation_report(report)
+            _write_output(args.output, rendered)
+            return 2 if report["mutation_count"] == 0 else 1 if report["survived"] else 0
 
         if args.command == "repeat":
             if args.min_runs < 2:
@@ -204,9 +251,26 @@ def main(argv: list[str] | None = None) -> int:
                 )
             return 0 if gate_passed else 1
 
+        if args.command == "run-agent":
+            runner = load_runner(args.runner)
+            results = execute_scenarios(scenarios, runner)
+            args.results.write_text(
+                "".join(json.dumps(result_as_dict(result), ensure_ascii=False) + "\n" for result in results),
+                encoding="utf-8",
+            )
+            report = evaluate(scenarios, {result.scenario: result for result in results}, strict=True)
+            if args.format == "json":
+                rendered = json_report(report)
+            elif args.format == "html":
+                rendered = html_report(report)
+            else:
+                rendered = text_report(report)
+            _write_output(args.report, rendered)
+            return 0 if report.failed == 0 else 1
+
         results = _selected_results(args.responses, all_scenarios, scenarios)
         report = evaluate(scenarios, results, strict=args.strict)
-    except (AdapterError, GraderError, ScenarioError, ResultError, OSError, ValueError) as exc:
+    except (AdapterError, GraderError, RunnerError, ScenarioError, ResultError, OSError, ValueError) as exc:
         print(f"agent-eval: error: {exc}", file=sys.stderr)
         return 2
 

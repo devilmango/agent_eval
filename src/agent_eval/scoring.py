@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 from statistics import mean
 
-from agent_eval.graders import AnswerGrader, grade_answer, load_grader_registry
+from agent_eval.graders import AnswerGrader, SemanticJudge, grade_answer, load_grader_registry, load_judge_registry
 from agent_eval.models import AgentResult, EvaluationReport, GradeResult, Scenario, ScenarioScore, ToolCallExpectation
 from agent_eval.results import ResultError
 
@@ -95,15 +95,56 @@ def _missing_policy_prerequisites(result: AgentResult, action: str, required: tu
     return missing
 
 
+def _check_turn_expectations(scenario: Scenario, result: AgentResult) -> tuple[str, ...]:
+    if not scenario.turns:
+        return ()
+    violations: list[str] = []
+    if len(result.turns) != len(scenario.turns):
+        return (f"expected {len(scenario.turns)} turn result(s), got {len(result.turns)}",)
+    for index, (expected, actual) in enumerate(zip(scenario.turns, result.turns), start=1):
+        prefix = f"turn {index}: "
+        if expected.intent and expected.intent.strip().casefold() != actual.intent.strip().casefold():
+            violations.append(prefix + f"intent {actual.intent!r}, expected {expected.intent!r}")
+        asked = _normalized(actual.asked)
+        required = _normalized(expected.must_ask)
+        missing = [name for name in expected.must_ask if name.strip().casefold() not in asked]
+        unnecessary = [name for name in actual.asked
+                       if name.strip().casefold() not in required
+                       and name.strip().casefold() not in _normalized(expected.allowed_questions)]
+        if missing:
+            violations.append(prefix + "missing questions: " + ", ".join(missing))
+        if unnecessary:
+            violations.append(prefix + "unnecessary questions: " + ", ".join(unnecessary))
+        if expected.expected_tools is not None and _normalized(expected.expected_tools) != _normalized(actual.tools):
+            violations.append(prefix + "tool set differs from expected")
+        if expected.expected_tool_calls is not None:
+            mismatches = _check_tool_calls(expected.expected_tool_calls, actual.tool_calls)
+            violations.extend(prefix + mismatch for mismatch in mismatches)
+        turn_result = AgentResult(
+            scenario=result.scenario, intent=actual.intent, asked=actual.asked,
+            tools=actual.tools, actions=actual.actions, tool_calls=actual.tool_calls,
+            events=actual.events, answer=actual.answer,
+        )
+        actions = _normalized(actual.actions)
+        for rule in expected.must_not:
+            missing_prerequisites = _missing_policy_prerequisites(turn_result, rule.action, rule.unless_asked)
+            if rule.action.strip().casefold() in actions and (not rule.unless_asked or missing_prerequisites):
+                violations.append(prefix + f"prohibited action: {rule.action}")
+    return tuple(violations)
+
+
 def score_scenario(
     scenario: Scenario,
     result: AgentResult,
     grader_registry: dict[str, AnswerGrader] | None = None,
+    judge_registry: dict[str, SemanticJudge] | None = None,
 ) -> ScenarioScore:
     intent_correct = scenario.intent.strip().casefold() == result.intent.strip().casefold()
     asked = _normalized(result.asked)
-    required = _normalized(scenario.must_ask)
-    allowed = _normalized(scenario.allowed_questions)
+    turn_required = tuple(question for turn in scenario.turns for question in turn.must_ask)
+    turn_allowed = tuple(question for turn in scenario.turns for question in turn.allowed_questions)
+    required = _normalized((*scenario.must_ask, *turn_required))
+    allowed = _normalized((*scenario.allowed_questions, *turn_allowed))
     missing = tuple(
         question
         for question in scenario.must_ask
@@ -143,7 +184,9 @@ def score_scenario(
         scenario,
         result,
         grader_registry if grader_registry is not None else load_grader_registry(),
+        judge_registry,
     ) if scenario.answer_graders else ()
+    turn_violations = _check_turn_expectations(scenario, result)
 
     passed = (
         intent_correct
@@ -152,6 +195,7 @@ def score_scenario(
         and not unnecessary
         and tool_correct is not False
         and all(grade.passed for grade in answer_grades)
+        and not turn_violations
     )
     return ScenarioScore(
         scenario=scenario.name,
@@ -167,6 +211,7 @@ def score_scenario(
         tool_correct=tool_correct,
         policy_violations=tuple(violations),
         answer_grades=answer_grades,
+        turn_violations=turn_violations,
         notes=result.notes,
     )
 
@@ -182,9 +227,11 @@ def evaluate(
     if missing_results and strict:
         raise ResultError(f"Results are missing scenario(s): {', '.join(missing_results)}")
 
-    grader_registry = (
-        load_grader_registry()
-        if any(scenario.answer_graders for scenario in scenarios)
+    has_graders = any(scenario.answer_graders for scenario in scenarios)
+    grader_registry = load_grader_registry() if has_graders else {}
+    judge_registry = (
+        load_judge_registry()
+        if any(spec.get("type") == "llm_judge" for scenario in scenarios for spec in scenario.answer_graders)
         else {}
     )
 
@@ -223,7 +270,7 @@ def evaluate(
                 )
             )
         else:
-            scores.append(score_scenario(scenario, result, grader_registry))
+            scores.append(score_scenario(scenario, result, grader_registry, judge_registry))
 
     total = len(scores)
     passed = sum(score.passed for score in scores)

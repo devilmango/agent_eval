@@ -2,9 +2,9 @@
 
 **A lightweight, provider-independent harness for evaluating AI agent behavior against repeatable scenarios.**
 
-Describe expected behavior in YAML, record what your agent actually asked and did as JSON Lines, and score the run from the command line. Use it to catch changes in intent selection, tool use, required questions, and policy-sensitive actions before they reach users.
+Describe expected behavior in YAML, execute scenarios through an optional runner plugin or score saved JSON Lines, and catch changes in intent selection, tool use, required questions, and policy-sensitive actions before they reach users.
 
-Agent Eval does not call a model or depend on an agent framework. A small adapter turns your agent's execution trace into the result format below, so the same scenarios can be run against different prompts, models, and orchestration stacks.
+The core package has no model-provider or agent-framework dependency. Optional runner, trace-adapter, and semantic-judge plugins let teams connect their own stack without coupling the core harness to a provider.
 
 ## What it checks
 
@@ -16,8 +16,10 @@ Agent Eval does not call a model or depend on an agent framework. A small adapte
 - **Scenario pass rate** — did each scenario satisfy all of its declared checks?
 - **Run-to-run stability** — how consistent are those scores across repeated agent executions?
 - **HTML reports** — can reviewers inspect a run or repeated-run analysis in a browser?
+- **Multi-turn conversations** — can expectations be checked across turns while preserving order?
+- **Coverage and mutation audits** — which behavior dimensions have scenarios, and do those scenarios catch representative regressions?
 
-The checks are deterministic and work over structured traces. They don't require an LLM judge, network access, or a model API key.
+Built-in checks are deterministic and work over structured traces. Semantic judges are opt-in plugins; the core does not make provider calls or require model credentials.
 
 ## Quick start
 
@@ -42,6 +44,7 @@ Intent accuracy:       100.0%
 Tool accuracy:         100.0%
 Policy compliance:     100.0%
 Unnecessary questions: 0.0%
+Answer quality:        50.0%
 ```
 
 The CLI returns exit code `0` when every scenario passes, `1` when one or more scenarios fail, and `2` for invalid input. This makes it straightforward to use as a CI quality gate.
@@ -91,6 +94,34 @@ agent-eval run scenarios/ --responses results.jsonl --strict
 
 Paths use dot notation for nested objects and `[*]` to collect a field from each list item. `scenario` and `intent` mappings are required; other result fields are optional. See [`examples/adapter_mapping.yaml`](examples/adapter_mapping.yaml) and [`examples/framework-traces.jsonl`](examples/framework-traces.jsonl) for a runnable example. For frameworks with non-JSON trace objects, implement the small `TraceAdapter` protocol and convert those objects to the same canonical result fields.
 
+Framework packages can register optional adapters under the `agent_eval.adapters` Python entry-point group. Load one by its entry-point name:
+
+```bash
+agent-eval adapt-framework my-framework traces.jsonl --output results.jsonl
+```
+
+The plugin exposes `adapt(record) -> AgentResult`. This keeps framework SDKs and their version changes out of the core install.
+
+For example, an integration package registers `[project.entry-points."agent_eval.adapters"]` with `my-framework = "my_adapter:Adapter"`. Adapter classes or factories are loaded only when selected by the command.
+
+### Execute an agent directly
+
+Install a runner plugin in the `agent_eval.runners` entry-point group, then execute scenarios and save both captured results and an evaluation report:
+
+```bash
+agent-eval run-agent scenarios/ --runner my-agent \
+  --results run.jsonl --report report.html --format html
+```
+
+A runner implements `run_turn(scenario, user_input, history) -> AgentTurnResult`. Agent Eval calls it once for a single-turn scenario and sequentially for each `turns` entry, passing prior turn results as history. The runner owns provider setup, tool execution, timeouts, and credentials; it should return observed structured behavior instead of inferring tool use from answer text.
+
+Register it from the runner package's `pyproject.toml`:
+
+```toml
+[project.entry-points."agent_eval.runners"]
+my-agent = "my_agent.agent_eval:Runner"
+```
+
 ## Define scenarios
 
 Create a `.yaml` or `.yml` file in a scenario directory:
@@ -127,6 +158,28 @@ tags: [scheduling, safety]
 | `allowed_questions` | No | Additional question identifiers permitted for this scenario. |
 | `expected.answer_graders` | No | Deterministic checks or installed grader plugins applied to the agent's final answer. |
 | `tags` | No | Labels for selecting related scenarios from the CLI. |
+| `turns` | No | Ordered conversation inputs with optional expectations for each turn. Use instead of `input`. |
+
+For a multi-turn scenario, use `turns` instead of `input`. Top-level `expected` fields check the aggregate conversation and final intent; each turn can add specific assertions:
+
+```yaml
+scenario: appointment_booking_conversation
+turns:
+  - input:
+      user: "I need to book an appointment."
+    expected:
+      intent: BOOK
+      must_ask: [preferred_date]
+  - input:
+      user: "Tomorrow morning."
+    expected:
+      intent: BOOK
+      must_ask: [patient_identity]
+expected:
+  intent: BOOK
+```
+
+Turn expectations can include `intent`, `must_ask`, `tools`, and `tool_calls`; turn-level `must_not` and `allowed_questions` are supported too. Recorded results keep an ordered `turns` array, and aggregate checks still use the combined trace.
 
 Question, tool, and action names are identifiers agreed on by your adapter and scenario files. Tool order doesn't matter; an extra or missing tool makes the tool check fail. Identifiers are compared without letter case or surrounding whitespace.
 
@@ -182,6 +235,7 @@ Write one JSON object per line. Each `scenario` must match one scenario ID.
 | `tool_calls` | No | Ordered tool calls as objects with `name` and an `arguments` mapping. This can supply the tool list when `tools` is omitted. |
 | `actions` | No | Action identifiers checked against the scenario's `must_not` list. |
 | `events` | No | Ordered `{type, name}` records, where type is `question` or `action`. Needed to verify that conditional policy prerequisites happened before an action. |
+| `turns` | No | Ordered per-turn result records for a multi-turn scenario. Aggregate fields are derived from turns when omitted. |
 | `answer` | No | Final answer text used only when the scenario declares answer graders. |
 | `notes` | No | Optional diagnostic text displayed with a failing scenario. |
 
@@ -263,6 +317,39 @@ Built-in grader types are `contains_any`, `contains_all`, `not_contains`, `min_l
 
 Custom graders can be installed as Python entry points in the `agent_eval.graders` group. Each entry-point name is the scenario's `type`; its loaded class/factory/object must expose `grade(answer: str, config: Mapping[str, Any]) -> GradeResult`. The `GradeResult` contains a normalized `score` from 0 to 1, `passed`, optional `feedback`, and optional `metadata`. Grader packages run in-process and should be treated as trusted code.
 
+For semantic scoring, install a judge plugin in `agent_eval.judges` and declare `type: llm_judge`:
+
+```yaml
+expected:
+  intent: OFFICE_HOURS
+  answer_graders:
+    - type: llm_judge
+      judge: internal_judge
+      model: evaluator-model-v1
+      threshold: 0.8
+      rubric: "Check that the answer is complete, directly answers the question, and does not invent hours."
+```
+
+The plugin implements `judge(request: JudgeRequest) -> GradeResult` and exposes a `version` string. Results record the configured model, judge name and version, rubric and SHA-256, score, and rationale (`feedback`). Provider selection, network access, privacy controls, and reproducibility of the underlying model remain the plugin's responsibility.
+
+Register a judge with an entry point such as `[project.entry-points."agent_eval.judges"]` and `internal_judge = "my_package.judge:Judge"`. Judge plugins run only when a scenario explicitly configures `llm_judge`.
+
+### Audit scenario coverage and sensitivity
+
+Inspect which intent, tool, policy, tag, and check dimensions your scenarios declare:
+
+```bash
+agent-eval coverage scenarios/ --format json
+```
+
+Run a deterministic mutation audit against a passing result set to check whether the evaluator catches regressions such as wrong intent, missing required questions, changed tools, and prohibited actions:
+
+```bash
+agent-eval mutate scenarios/ --responses run.jsonl --format json
+```
+
+The command exits `1` when a generated mutation survives and `2` when there are no eligible mutations to audit. Missing or already-failing baseline scenarios are reported as not checked. Coverage summarizes what is declared; it does not prove that a scenario set represents production traffic.
+
 ### Ingest OpenTelemetry traces
 
 Convert an OTLP/JSON trace export into the canonical JSONL result format:
@@ -300,7 +387,7 @@ Run the same command after your application creates `run.jsonl`. A failed scenar
 
 The example assumes your preceding CI steps installed this package and generated the result file. Agent Eval intentionally does not start your agent or manage model credentials.
 
-The included [GitHub Actions workflow](.github/workflows/ci.yml) runs the unit suite across Python 3.10–3.12, evaluates the checked-in sample results, creates an HTML report, and uploads it as a workflow artifact.
+The included [GitHub Actions workflow](.github/workflows/ci.yml) runs the unit suite across Python 3.10–3.12, evaluates the checked-in sample results, checks a repeated-run gate, creates HTML reports, and uploads them as workflow artifacts.
 
 ## Understand the metrics
 
@@ -312,7 +399,7 @@ The included [GitHub Actions workflow](.github/workflows/ci.yml) runs the unit s
 | Unnecessary questions | Asked identifiers that are neither required nor allowed ÷ all recorded questions. Displays 0% when the agent asked no questions. |
 | Scenario pass rate | Scenarios passing intent, required-question, unnecessary-question, declared tool, and prohibited-action checks ÷ all scenarios. |
 
-A scenario fails if the intent is wrong, a required question is missing, an unnecessary question was asked, a declared tool set doesn't match, a prohibited action appears in the trace, or any configured answer grader fails. Policy checks look for exact action identifiers; they don't interpret free-form text or decide whether an action was safe in context.
+A scenario fails if the intent is wrong, a required question is missing, an unnecessary question was asked, a declared tool set doesn't match, a prohibited action appears in the trace, a turn expectation fails, or any configured answer grader fails. Policy checks look for exact action identifiers; they don't interpret free-form text or decide whether an action was safe in context.
 
 ## Project structure
 
@@ -329,11 +416,7 @@ agent_eval/
 
 ## Current scope
 
-Agent Eval is an early, local-first harness. It evaluates recorded structured traces, uses exact identifier matching, and produces aggregate metrics plus scenario-level failure details. It does not execute agents or guarantee that a scenario collection covers every production risk. Built-in answer graders are simple deterministic checks, and confidence intervals assume independent Bernoulli outcomes. Treat scores as evidence about the scenarios and captures you supplied, and expand the suite as you learn about real user behavior and failure modes.
-
-## Next ideas
-
-Potential addition: framework-specific packages for common agent frameworks, built on the adapter protocol without adding framework dependencies to the core package.
+Agent Eval is an early, local-first harness. It evaluates structured traces, uses exact identifier matching for deterministic checks, and produces aggregate metrics plus scenario-level failure details. Runner and judge plugins execute in-process and may make provider calls, so install only trusted integrations. Built-in answer graders are simple deterministic checks, and confidence intervals assume independent Bernoulli outcomes. Treat scores as evidence about the scenarios and captures you supplied, and expand the suite as you learn about real user behavior and failure modes.
 
 The repository includes GitHub Actions CI for Python 3.10–3.12, unit validation, and the example evaluation command.
 

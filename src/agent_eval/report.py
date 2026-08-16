@@ -42,6 +42,7 @@ def text_report(report: EvaluationReport, *, details: bool = True) -> str:
                 reasons.extend(score.tool_call_mismatches or ("tool set differs from expected",))
             if score.policy_violations:
                 reasons.append("policy violations: " + ", ".join(score.policy_violations))
+            reasons.extend(score.turn_violations)
             if score.notes:
                 reasons.append(score.notes)
             for grade in score.answer_grades:
@@ -79,6 +80,7 @@ def html_report(report: EvaluationReport) -> str:
             failures.extend(score.tool_call_mismatches or ("Tool set differs from expected",))
         if score.policy_violations:
             failures.append("Policy violations: " + ", ".join(score.policy_violations))
+        failures.extend(score.turn_violations)
         if score.notes:
             failures.append(score.notes)
         for grade in score.answer_grades:

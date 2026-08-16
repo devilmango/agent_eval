@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import dataclass
+from hashlib import sha256
 from importlib.metadata import entry_points
+import json
 from typing import Any, Protocol
 
 from agent_eval.models import AgentResult, GradeResult, Scenario
@@ -18,6 +21,24 @@ class AnswerGrader(Protocol):
 
     def grade(self, answer: str, config: Mapping[str, Any]) -> GradeResult:
         """Return a normalized score in [0, 1] and a pass/fail decision."""
+
+
+@dataclass(frozen=True)
+class JudgeRequest:
+    scenario: str
+    user_input: Mapping[str, Any]
+    conversation: tuple[Mapping[str, Any], ...]
+    expected: Mapping[str, Any]
+    answer: str
+    rubric: str | Mapping[str, Any]
+    model: str | None = None
+
+
+class SemanticJudge(Protocol):
+    version: str
+
+    def judge(self, request: JudgeRequest) -> GradeResult:
+        """Return a scored judgment and a human-readable rationale."""
 
 
 class _ContainsAny:
@@ -128,14 +149,98 @@ def load_grader_registry() -> dict[str, AnswerGrader]:
     return registry
 
 
+def load_judge_registry() -> dict[str, SemanticJudge]:
+    points = entry_points()
+    plugins = points.select(group="agent_eval.judges") if hasattr(points, "select") else points.get("agent_eval.judges", [])
+    registry: dict[str, SemanticJudge] = {}
+    for point in plugins:
+        if point.name in registry:
+            raise GraderError(f"multiple semantic judges are named '{point.name}'")
+        try:
+            judge = point.load()
+            if isinstance(judge, type):
+                judge = judge()
+            elif callable(judge) and not hasattr(judge, "judge"):
+                judge = judge()
+        except Exception as exc:
+            raise GraderError(f"could not load semantic judge '{point.name}': {exc}") from exc
+        if not hasattr(judge, "judge"):
+            raise GraderError(f"semantic judge '{point.name}' must provide judge(request)")
+        registry[point.name] = judge
+    return registry
+
+
 def grade_answer(
     scenario: Scenario,
     result: AgentResult,
     registry: Mapping[str, AnswerGrader],
+    judges: Mapping[str, SemanticJudge] | None = None,
 ) -> tuple[GradeResult, ...]:
     grades: list[GradeResult] = []
     for spec in scenario.answer_graders:
         grader_name = spec["type"]
+        if grader_name == "llm_judge":
+            judge_name = spec.get("judge")
+            judge = (judges or {}).get(judge_name) if isinstance(judge_name, str) else None
+            if judge is None:
+                raise GraderError(
+                    f"unknown semantic judge {judge_name!r} in scenario '{scenario.name}'; "
+                    "install a plugin exposing it in the 'agent_eval.judges' entry-point group"
+                )
+            rubric = spec.get("rubric")
+            if not isinstance(rubric, (str, dict)) or not rubric:
+                raise GraderError("llm_judge requires a non-empty 'rubric'")
+            model = spec.get("model")
+            if model is not None and not isinstance(model, str):
+                raise GraderError("llm_judge 'model' must be a string")
+            request = JudgeRequest(
+                scenario=scenario.name,
+                user_input=scenario.input,
+                conversation=tuple(turn.input for turn in scenario.turns) or (scenario.input,),
+                expected={"intent": scenario.intent, "must_ask": scenario.must_ask,
+                          "tools": scenario.expected_tools, "must_not": [rule.action for rule in scenario.must_not],
+                          "turns": [{"intent": turn.intent, "must_ask": turn.must_ask,
+                                     "tools": turn.expected_tools,
+                                     "must_not": [rule.action for rule in turn.must_not]}
+                                    for turn in scenario.turns]},
+                answer=result.answer or "",
+                rubric=rubric,
+                model=model,
+            )
+            try:
+                output = judge.judge(request)
+            except Exception as exc:
+                raise GraderError(f"semantic judge '{judge_name}' failed for '{scenario.name}': {exc}") from exc
+            if not isinstance(output, GradeResult):
+                raise GraderError(f"semantic judge '{judge_name}' must return a GradeResult")
+            if isinstance(output.score, bool) or not isinstance(output.score, (int, float)) or not 0 <= output.score <= 1:
+                raise GraderError(f"semantic judge '{judge_name}' returned a score outside [0, 1]")
+            if not isinstance(output.metadata, Mapping):
+                raise GraderError(f"semantic judge '{judge_name}' metadata must be a mapping")
+            if not isinstance(output.feedback, str):
+                raise GraderError(f"semantic judge '{judge_name}' feedback must be a string rationale")
+            threshold = spec.get("threshold", 0.7)
+            if isinstance(threshold, bool) or not isinstance(threshold, (int, float)) or not 0 <= threshold <= 1:
+                raise GraderError("llm_judge threshold must be a number between 0 and 1")
+            fingerprint = sha256(json.dumps(rubric, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
+            metadata = {
+                **output.metadata,
+                "judge": judge_name,
+                "configured_model": model,
+                "model": output.metadata.get("model", model),
+                "grader_version": str(getattr(judge, "version", "unspecified")),
+                "rubric_sha256": fingerprint,
+            }
+            grades.append(GradeResult(
+                grader=grader_name,
+                score=float(output.score),
+                passed=float(output.score) >= float(threshold),
+                feedback=output.feedback,
+                rubric=dict(spec),
+                metadata=metadata,
+            ))
+            continue
+
         grader = registry.get(grader_name)
         if grader is None:
             raise GraderError(

@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from agent_eval.models import AgentResult, ToolCall, TraceEvent
+from agent_eval.models import AgentResult, AgentTurnResult, ToolCall, TraceEvent
 
 
 class ResultError(ValueError):
@@ -56,6 +56,37 @@ def _events(value: Any, line: int) -> tuple[TraceEvent, ...]:
     return tuple(events)
 
 
+def _turn_results(value: Any, line: int) -> tuple[AgentTurnResult, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, list) or not value:
+        raise ResultError(f"line {line}: 'turns' must be a non-empty list")
+    turns: list[AgentTurnResult] = []
+    for index, item in enumerate(value):
+        label = f"turns[{index}]"
+        if not isinstance(item, dict) or not isinstance(item.get("intent"), str) or not item["intent"]:
+            raise ResultError(f"line {line}: '{label}.intent' must be a non-empty string")
+        calls = _tool_calls(item.get("tool_calls"), line)
+        tools = _list_of_strings(item.get("tools"), f"{label}.tools", line)
+        if "tools" not in item and calls:
+            tools = tuple(call.name for call in calls)
+        turns.append(AgentTurnResult(
+            intent=item["intent"],
+            asked=_list_of_strings(item.get("asked"), f"{label}.asked", line),
+            tools=tools,
+            actions=_list_of_strings(item.get("actions"), f"{label}.actions", line),
+            tool_calls=calls,
+            events=_events(item.get("events"), line),
+            answer=item.get("answer"),
+            notes=item.get("notes", ""),
+        ))
+        if turns[-1].answer is not None and not isinstance(turns[-1].answer, str):
+            raise ResultError(f"line {line}: '{label}.answer' must be a string")
+        if not isinstance(turns[-1].notes, str):
+            raise ResultError(f"line {line}: '{label}.notes' must be a string")
+    return tuple(turns)
+
+
 def load_results(path: Path) -> dict[str, AgentResult]:
     results: dict[str, AgentResult] = {}
     try:
@@ -73,32 +104,48 @@ def load_results(path: Path) -> dict[str, AgentResult]:
         if not isinstance(item, dict):
             raise ResultError(f"line {line_number}: each result must be a JSON object")
         scenario = item.get("scenario")
-        intent = item.get("intent")
+        turns = _turn_results(item.get("turns"), line_number)
+        intent = item.get("intent", turns[-1].intent if turns else None)
         if not isinstance(scenario, str) or not scenario:
             raise ResultError(f"line {line_number}: 'scenario' must be a non-empty string")
         if not isinstance(intent, str) or not intent:
-            raise ResultError(f"line {line_number}: 'intent' must be a non-empty string")
+            raise ResultError(f"line {line_number}: 'intent' must be a non-empty string (or provide turns)")
         if scenario in results:
             raise ResultError(f"line {line_number}: duplicate result for '{scenario}'")
         notes = item.get("notes", "")
         if not isinstance(notes, str):
             raise ResultError(f"line {line_number}: 'notes' must be a string")
-        answer = item.get("answer")
-        if answer is not None and not isinstance(answer, str):
-            raise ResultError(f"line {line_number}: 'answer' must be a string")
-        calls = _tool_calls(item.get("tool_calls"), line_number)
+        asked = _list_of_strings(item.get("asked"), "asked", line_number)
         tools = _list_of_strings(item.get("tools"), "tools", line_number)
+        actions = _list_of_strings(item.get("actions"), "actions", line_number)
+        calls = _tool_calls(item.get("tool_calls"), line_number)
+        events = _events(item.get("events"), line_number)
+        if turns:
+            if "asked" not in item:
+                asked = tuple(value for turn in turns for value in turn.asked)
+            if "tools" not in item:
+                tools = tuple(value for turn in turns for value in turn.tools)
+            if "actions" not in item:
+                actions = tuple(value for turn in turns for value in turn.actions)
+            if "tool_calls" not in item:
+                calls = tuple(value for turn in turns for value in turn.tool_calls)
+            if "events" not in item:
+                events = tuple(value for turn in turns for value in turn.events)
         if "tools" not in item and calls:
             tools = tuple(call.name for call in calls)
+        answer = item.get("answer", turns[-1].answer if turns else None)
+        if answer is not None and not isinstance(answer, str):
+            raise ResultError(f"line {line_number}: 'answer' must be a string")
         results[scenario] = AgentResult(
             scenario=scenario,
             intent=intent,
-            asked=_list_of_strings(item.get("asked"), "asked", line_number),
+            asked=asked,
             tools=tools,
-            actions=_list_of_strings(item.get("actions"), "actions", line_number),
+            actions=actions,
             tool_calls=calls,
-            events=_events(item.get("events"), line_number),
+            events=events,
             answer=answer,
             notes=notes,
+            turns=turns,
         )
     return results

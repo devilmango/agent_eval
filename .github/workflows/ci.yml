@@ -23,6 +23,10 @@ jobs:
         run: agent-eval run scenarios/ --responses examples/responses.jsonl --strict --format html --output agent-eval-report.html
       - name: Check repeated-run confidence gate
         run: agent-eval repeat scenarios/ --runs examples/responses.jsonl examples/responses.jsonl --min-runs 2 --confidence 0.95 --min-pass-rate 0.60 --strict --format html --output agent-eval-stability.html
+      - name: Audit scenario coverage and mutation sensitivity
+        run: |
+          agent-eval coverage scenarios/ --format json --output agent-eval-coverage.json
+          agent-eval mutate scenarios/ --responses examples/responses.jsonl --format json --output agent-eval-mutations.json
       - name: Upload evaluation report
         if: always()
         uses: actions/upload-artifact@v4
@@ -31,4 +35,6 @@ jobs:
           path: |
             agent-eval-report.html
             agent-eval-stability.html
+            agent-eval-coverage.json
+            agent-eval-mutations.json
           if-no-files-found: ignore

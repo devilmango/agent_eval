@@ -1,6 +1,8 @@
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
-from agent_eval.adapters import PathMappingAdapter
+from agent_eval.adapters import PathMappingAdapter, load_adapter_plugin
 
 
 class PathMappingAdapterTests(unittest.TestCase):
@@ -39,3 +41,14 @@ class PathMappingAdapterTests(unittest.TestCase):
     def test_requires_scenario_and_intent_mappings(self):
         with self.assertRaisesRegex(ValueError, "requires a path for 'intent'"):
             PathMappingAdapter({"scenario": "scenario"})
+
+    def test_loads_optional_framework_adapter_entry_point(self):
+        class Adapter:
+            def adapt(self, record):
+                return record
+
+        point = SimpleNamespace(name="framework-x", load=lambda: Adapter)
+        metadata = SimpleNamespace(select=lambda **kwargs: [point])
+        with patch("agent_eval.adapters.entry_points", return_value=metadata):
+            adapter = load_adapter_plugin("framework-x")
+        self.assertIsInstance(adapter, Adapter)

@@ -35,6 +35,29 @@ class GradeResult:
 
 
 @dataclass(frozen=True)
+class ScenarioTurn:
+    input: dict[str, Any]
+    intent: str | None = None
+    must_ask: tuple[str, ...] = ()
+    expected_tools: tuple[str, ...] | None = None
+    must_not: tuple[PolicyRule, ...] = ()
+    allowed_questions: tuple[str, ...] = ()
+    expected_tool_calls: tuple[ToolCallExpectation, ...] | None = None
+
+
+@dataclass(frozen=True)
+class AgentTurnResult:
+    intent: str
+    asked: tuple[str, ...] = ()
+    tools: tuple[str, ...] = ()
+    actions: tuple[str, ...] = ()
+    tool_calls: tuple[ToolCall, ...] = ()
+    events: tuple[TraceEvent, ...] = ()
+    answer: str | None = None
+    notes: str = ""
+
+
+@dataclass(frozen=True)
 class PolicyRule:
     action: str
     unless_asked: tuple[str, ...] = ()
@@ -53,6 +76,7 @@ class Scenario:
     answer_graders: tuple[dict[str, Any], ...] = ()
     tags: tuple[str, ...] = ()
     source: str = ""
+    turns: tuple[ScenarioTurn, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -66,6 +90,7 @@ class AgentResult:
     events: tuple[TraceEvent, ...] = ()
     answer: str | None = None
     notes: str = ""
+    turns: tuple[AgentTurnResult, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -83,6 +108,7 @@ class ScenarioScore:
     tool_correct: bool | None = None
     policy_violations: tuple[str, ...] = ()
     answer_grades: tuple[GradeResult, ...] = ()
+    turn_violations: tuple[str, ...] = ()
     notes: str = ""
 
     def as_dict(self) -> dict[str, Any]:

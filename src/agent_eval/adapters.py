@@ -8,6 +8,7 @@ built-in path mapping adapter handles JSON traces from any framework.
 from __future__ import annotations
 
 import re
+from importlib.metadata import entry_points
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -18,6 +19,29 @@ from agent_eval.models import AgentResult, ToolCall, TraceEvent
 
 class AdapterError(ValueError):
     """Raised when a trace cannot be normalized by an adapter."""
+
+
+def load_adapter_plugin(name: str) -> "TraceAdapter":
+    """Load an optional adapter from the ``agent_eval.adapters`` entry-point group."""
+    points = entry_points()
+    plugins = points.select(group="agent_eval.adapters") if hasattr(points, "select") else points.get("agent_eval.adapters", [])
+    matches = [point for point in plugins if point.name == name]
+    if not matches:
+        available = ", ".join(sorted(point.name for point in plugins)) or "none installed"
+        raise AdapterError(f"unknown adapter '{name}' (available: {available})")
+    if len(matches) > 1:
+        raise AdapterError(f"multiple installed adapters are named '{name}'")
+    try:
+        adapter = matches[0].load()
+        if isinstance(adapter, type):
+            adapter = adapter()
+        elif callable(adapter) and not hasattr(adapter, "adapt"):
+            adapter = adapter()
+    except Exception as exc:
+        raise AdapterError(f"could not load adapter '{name}': {exc}") from exc
+    if not hasattr(adapter, "adapt"):
+        raise AdapterError(f"adapter '{name}' must provide adapt(record)")
+    return adapter
 
 
 class TraceAdapter(Protocol):
@@ -167,7 +191,7 @@ class PathMappingAdapter:
 
 def result_as_dict(result: AgentResult) -> dict[str, Any]:
     """Serialize a canonical result to the public JSONL schema."""
-    return {
+    output = {
         "scenario": result.scenario,
         "intent": result.intent,
         "asked": list(result.asked),
@@ -182,3 +206,21 @@ def result_as_dict(result: AgentResult) -> dict[str, Any]:
         "notes": result.notes,
         "answer": result.answer,
     }
+    if result.turns:
+        output["turns"] = [
+            {
+                "intent": turn.intent,
+                "asked": list(turn.asked),
+                "tools": list(turn.tools),
+                "actions": list(turn.actions),
+                "tool_calls": [
+                    {"name": call.name, "arguments": call.arguments}
+                    for call in turn.tool_calls
+                ],
+                "events": [{"type": event.event_type, "name": event.name} for event in turn.events],
+                "answer": turn.answer,
+                "notes": turn.notes,
+            }
+            for turn in result.turns
+        ]
+    return output
