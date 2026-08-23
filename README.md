@@ -18,6 +18,11 @@ The core package has no model-provider or agent-framework dependency. Optional r
 - **HTML reports** — can reviewers inspect a run or repeated-run analysis in a browser?
 - **Multi-turn conversations** — can expectations be checked across turns while preserving order?
 - **Coverage and mutation audits** — which behavior dimensions have scenarios, and do those scenarios catch representative regressions?
+- **Framework adapters** — built-in normalizers for OpenAI Agents SDK spans and LangChain event/run records, alongside OpenTelemetry and custom adapters.
+- **Safe tool fixtures** — deterministic mock tool responses are available to runner plugins; unknown calls fail closed without reaching external services.
+- **Execution metadata** — optional model, prompt version, latency, token, and cost fields flow into reports and repeated-run trend summaries.
+- **Judge calibration** — cache repeated semantic judgments, inspect score stability, and compare judge decisions across saved reports.
+- **Coverage-guided suggestions** — generate review-only test candidates from coverage gaps without inventing expected labels.
 
 Built-in checks are deterministic and work over structured traces. Semantic judges are opt-in plugins; the core does not make provider calls or require model credentials.
 
@@ -121,6 +126,29 @@ Register it from the runner package's `pyproject.toml`:
 [project.entry-points."agent_eval.runners"]
 my-agent = "my_agent.agent_eval:Runner"
 ```
+
+Runners that accept a `tool_sandbox` keyword receive a scenario-scoped fixture sandbox. It only serves declared fixtures and raises `ToolFixtureError` for unmatched calls:
+
+```yaml
+tool_fixtures:
+  - name: lookup_appointment
+    arguments:
+      patient_id: demo-patient
+    response:
+      appointment_id: appt-123
+      date: "2026-10-14"
+```
+
+Call `tool_sandbox.call("lookup_appointment", {"patient_id": "demo-patient"})` from the runner. Fixtures may also specify `error` instead of `response` to exercise tool failures. Matching uses the declared argument mapping as a required subset, so extra runtime arguments are allowed.
+
+Built-in trace normalization is available without installing framework SDKs:
+
+```bash
+agent-eval adapt-framework openai-agents openai-spans.jsonl --output results.jsonl
+agent-eval adapt-framework langchain langchain-events.jsonl --output results.jsonl
+```
+
+Both adapters expect `agent_eval.scenario` and `agent_eval.intent` labels in trace metadata (or top-level `scenario` and `intent`). Framework trace schemas change over time; keep a small exported fixture from your installed SDK version and validate mappings before using the adapter in production.
 
 ## Define scenarios
 
@@ -238,6 +266,7 @@ Write one JSON object per line. Each `scenario` must match one scenario ID.
 | `turns` | No | Ordered per-turn result records for a multi-turn scenario. Aggregate fields are derived from turns when omitted. |
 | `answer` | No | Final answer text used only when the scenario declares answer graders. |
 | `notes` | No | Optional diagnostic text displayed with a failing scenario. |
+| `metadata` | No | Execution details such as `model`, `prompt_version`, `latency_ms`, `input_tokens`, `output_tokens`, and `cost_usd`. |
 
 An adapter can capture results from an agent trace, tool middleware, or your application's own structured response. Keep the result file free of real patient information, credentials, and other sensitive data—scenario identifiers and behavior labels are enough for scoring.
 
@@ -257,6 +286,23 @@ agent-eval run scenarios/ --responses run.jsonl --format json > report.json
 ```
 
 Use `--strict` to return an input error when any scenario result is missing. Without it, missing results appear as failed scenarios in the report. Unknown and duplicate scenario IDs in the result file are always input errors. Use `--quiet-details` to print only the text summary.
+
+Semantic judges can be repeated and cached during evaluation. Cache files should be treated as evaluation artifacts because they contain judge scores, rationales, and request fingerprints:
+
+```bash
+agent-eval run scenarios/ --responses run.jsonl --judge-repetitions 3 --judge-cache .agent-eval/judges.json
+agent-eval judge-agreement report-a.json report-b.json
+```
+
+Repeated judge scores and their population standard deviation are recorded in grade metadata. `judge-agreement` compares pass/fail decisions and score ranges by scenario across JSON reports. It needs at least two reports containing semantic judge results.
+
+Generate deterministic coverage-guided candidates for human review:
+
+```bash
+agent-eval suggest scenarios/ --limit 25 --output suggestions.json
+```
+
+Suggestions include a small input paraphrase and missing behavior dimensions. They are deliberately not executable scenarios: a reviewer must author and verify expected behavior before adopting a candidate.
 
 Compare a candidate run with a baseline to see scenario regressions and metric changes:
 

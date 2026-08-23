@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from statistics import mean
+from pathlib import Path
 
 from agent_eval.graders import AnswerGrader, SemanticJudge, grade_answer, load_grader_registry, load_judge_registry
 from agent_eval.models import AgentResult, EvaluationReport, GradeResult, Scenario, ScenarioScore, ToolCallExpectation
@@ -138,6 +139,7 @@ def score_scenario(
     result: AgentResult,
     grader_registry: dict[str, AnswerGrader] | None = None,
     judge_registry: dict[str, SemanticJudge] | None = None,
+    *, judge_cache: Path | None = None, judge_repetitions: int = 1,
 ) -> ScenarioScore:
     intent_correct = scenario.intent.strip().casefold() == result.intent.strip().casefold()
     asked = _normalized(result.asked)
@@ -185,6 +187,8 @@ def score_scenario(
         result,
         grader_registry if grader_registry is not None else load_grader_registry(),
         judge_registry,
+        judge_cache=judge_cache,
+        judge_repetitions=judge_repetitions,
     ) if scenario.answer_graders else ()
     turn_violations = _check_turn_expectations(scenario, result)
 
@@ -217,7 +221,8 @@ def score_scenario(
 
 
 def evaluate(
-    scenarios: list[Scenario], results: dict[str, AgentResult], *, strict: bool = False
+    scenarios: list[Scenario], results: dict[str, AgentResult], *, strict: bool = False,
+    judge_cache: Path | None = None, judge_repetitions: int = 1,
 ) -> EvaluationReport:
     expected_names = {scenario.name for scenario in scenarios}
     unknown = sorted(results.keys() - expected_names)
@@ -270,7 +275,8 @@ def evaluate(
                 )
             )
         else:
-            scores.append(score_scenario(scenario, result, grader_registry, judge_registry))
+            scores.append(score_scenario(scenario, result, grader_registry, judge_registry,
+                                         judge_cache=judge_cache, judge_repetitions=judge_repetitions))
 
     total = len(scores)
     passed = sum(score.passed for score in scores)
@@ -282,6 +288,16 @@ def evaluate(
     unnecessary_count = sum(len(score.unnecessary_questions) for score in scores)
     answer_scores = [grade.score for score in scores for grade in score.answer_grades]
 
+    metadata_rows = [result.metadata for result in results.values() if result.metadata]
+    execution: dict = {"runs_with_metadata": len(metadata_rows)}
+    for field in ("latency_ms", "input_tokens", "output_tokens", "cost_usd"):
+        values = [row[field] for row in metadata_rows if isinstance(row.get(field), (int, float)) and not isinstance(row.get(field), bool)]
+        if values:
+            execution[field] = {"total": sum(values), "mean": mean(values), "min": min(values), "max": max(values)}
+    for field in ("model", "prompt_version"):
+        values = sorted({str(row[field]) for row in metadata_rows if row.get(field) is not None})
+        if values:
+            execution[field + "s"] = values
     return EvaluationReport(
         total=total,
         passed=passed,
@@ -296,4 +312,5 @@ def evaluate(
         ),
         answer_quality_score=mean(answer_scores) if answer_scores else None,
         scores=tuple(scores),
+        execution=execution,
     )

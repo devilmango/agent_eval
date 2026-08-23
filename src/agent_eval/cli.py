@@ -14,7 +14,7 @@ from agent_eval.comparison import compare_reports, text_comparison
 from agent_eval.graders import GraderError
 from agent_eval.models import AgentResult
 from agent_eval.otel import OpenTelemetryAdapter, load_otel_document
-from agent_eval.quality import mutation_report, scenario_coverage, text_coverage, text_mutation_report
+from agent_eval.quality import mutation_report, scenario_coverage, scenario_suggestions, judge_agreement, text_coverage, text_mutation_report
 from agent_eval.report import html_report, json_report, repeated_html_report, text_report
 from agent_eval.repeated import analyze_repeated_runs, text_repeated_report
 from agent_eval.results import ResultError, load_results
@@ -42,6 +42,8 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--output", type=Path, help="write the report to a file instead of stdout")
     run.add_argument("--strict", action="store_true", help="fail when any scenario result is missing")
     run.add_argument("--quiet-details", action="store_true", help="hide per-scenario failure details")
+    run.add_argument("--judge-cache", type=Path, help="cache semantic judge results in this JSON file")
+    run.add_argument("--judge-repetitions", type=int, default=1, help="repeat semantic judgments for stability (default: 1)")
     _add_tag_filters(run)
 
     adapt = commands.add_parser("adapt", help="convert framework JSONL traces into Agent Eval results")
@@ -93,12 +95,23 @@ def build_parser() -> argparse.ArgumentParser:
     run_agent.add_argument("--results", required=True, type=Path, help="write captured canonical JSONL results here")
     run_agent.add_argument("--report", type=Path, help="write evaluation report here (defaults to stdout)")
     run_agent.add_argument("--format", choices=("text", "json", "html"), default="text")
+    run_agent.add_argument("--judge-cache", type=Path, help="cache semantic judge results in this JSON file")
+    run_agent.add_argument("--judge-repetitions", type=int, default=1, help="repeat semantic judgments for stability (default: 1)")
     _add_tag_filters(run_agent)
 
     coverage = commands.add_parser("coverage", help="summarize behavior dimensions declared by scenarios")
     coverage.add_argument("scenarios", type=Path, help="scenario YAML file or directory")
     coverage.add_argument("--format", choices=("text", "json"), default="text")
     coverage.add_argument("--output", type=Path, help="write the report to a file instead of stdout")
+
+    suggest = commands.add_parser("suggest", help="generate review-only candidates from scenario coverage gaps")
+    suggest.add_argument("scenarios", type=Path)
+    suggest.add_argument("--limit", type=int, default=20)
+    suggest.add_argument("--output", type=Path)
+
+    audit = commands.add_parser("judge-agreement", help="compare semantic judge decisions across JSON evaluation reports")
+    audit.add_argument("reports", nargs="+", type=Path)
+    audit.add_argument("--output", type=Path)
 
     mutate = commands.add_parser("mutate", help="check whether scenarios catch representative trace regressions")
     mutate.add_argument("scenarios", type=Path, help="scenario YAML file or directory")
@@ -196,6 +209,14 @@ def main(argv: list[str] | None = None) -> int:
             rendered = json.dumps(report, indent=2, ensure_ascii=False) if args.format == "json" else text_coverage(report)
             _write_output(args.output, rendered)
             return 0
+        if args.command == "suggest":
+            if args.limit < 1:
+                raise ValueError("--limit must be at least 1")
+            _write_output(args.output, json.dumps(scenario_suggestions(all_scenarios, limit=args.limit), indent=2, ensure_ascii=False))
+            return 0
+        if args.command == "judge-agreement":
+            _write_output(args.output, json.dumps(judge_agreement(args.reports), indent=2, ensure_ascii=False))
+            return 0
         scenarios = filter_scenarios(
             all_scenarios,
             include_tags=tuple(args.tag),
@@ -258,7 +279,8 @@ def main(argv: list[str] | None = None) -> int:
                 "".join(json.dumps(result_as_dict(result), ensure_ascii=False) + "\n" for result in results),
                 encoding="utf-8",
             )
-            report = evaluate(scenarios, {result.scenario: result for result in results}, strict=True)
+            report = evaluate(scenarios, {result.scenario: result for result in results}, strict=True,
+                              judge_cache=args.judge_cache, judge_repetitions=args.judge_repetitions)
             if args.format == "json":
                 rendered = json_report(report)
             elif args.format == "html":
@@ -269,7 +291,8 @@ def main(argv: list[str] | None = None) -> int:
             return 0 if report.failed == 0 else 1
 
         results = _selected_results(args.responses, all_scenarios, scenarios)
-        report = evaluate(scenarios, results, strict=args.strict)
+        report = evaluate(scenarios, results, strict=args.strict,
+                          judge_cache=args.judge_cache, judge_repetitions=args.judge_repetitions)
     except (AdapterError, GraderError, RunnerError, ScenarioError, ResultError, OSError, ValueError) as exc:
         print(f"agent-eval: error: {exc}", file=sys.stderr)
         return 2

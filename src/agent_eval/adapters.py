@@ -8,6 +8,7 @@ built-in path mapping adapter handles JSON traces from any framework.
 from __future__ import annotations
 
 import re
+import json
 from importlib.metadata import entry_points
 from pathlib import Path
 from typing import Any, Protocol
@@ -23,6 +24,9 @@ class AdapterError(ValueError):
 
 def load_adapter_plugin(name: str) -> "TraceAdapter":
     """Load an optional adapter from the ``agent_eval.adapters`` entry-point group."""
+    builtins = {"openai-agents": OpenAIAgentsAdapter, "langchain": LangChainEventsAdapter}
+    if name in builtins:
+        return builtins[name]()
     points = entry_points()
     plugins = points.select(group="agent_eval.adapters") if hasattr(points, "select") else points.get("agent_eval.adapters", [])
     matches = [point for point in plugins if point.name == name]
@@ -49,6 +53,70 @@ class TraceAdapter(Protocol):
 
     def adapt(self, record: dict[str, Any]) -> AgentResult:
         """Convert a raw trace object into the canonical result model."""
+
+
+class OpenAIAgentsAdapter:
+    """Normalize OpenAI Agents SDK exported span records (without importing its SDK)."""
+
+    def adapt(self, record: dict[str, Any]) -> AgentResult:
+        data = record.get("span_data", record)
+        attrs = record.get("attributes", {})
+        name = data.get("name") or data.get("tool_name") or ""
+        scenario = attrs.get("agent_eval.scenario") or record.get("scenario")
+        intent = attrs.get("agent_eval.intent") or record.get("intent")
+        if not scenario or not intent:
+            raise AdapterError("OpenAI Agents span requires agent_eval.scenario and agent_eval.intent attributes")
+        call = []
+        if name and ("tool" in str(record.get("span_type", "")).lower() or data.get("type") in {"function", "function_call"} or "arguments" in data):
+            arguments = data.get("arguments", {})
+            if isinstance(arguments, str):
+                try:
+                    arguments = json.loads(arguments)
+                except json.JSONDecodeError:
+                    arguments = {"raw": arguments}
+            call = [ToolCall(str(name), arguments if isinstance(arguments, dict) else {})]
+        answer = attrs.get("agent.output") or data.get("output")
+        return AgentResult(scenario=str(scenario), intent=str(intent),
+                           tools=tuple(item.name for item in call), tool_calls=tuple(call),
+                           answer=answer if isinstance(answer, str) else None,
+                           metadata={"framework": "openai-agents", "model": attrs.get("gen_ai.request.model")})
+
+
+class LangChainEventsAdapter:
+    """Normalize LangChain/LangSmith run records and ``astream_events`` events."""
+
+    def adapt(self, record: dict[str, Any]) -> AgentResult:
+        metadata = record.get("metadata", {})
+        extra = record.get("extra", {})
+        metadata = {**(extra.get("metadata", {}) if isinstance(extra, dict) else {}),
+                    **(metadata if isinstance(metadata, dict) else {})}
+        scenario = metadata.get("agent_eval.scenario") or record.get("scenario")
+        intent = metadata.get("agent_eval.intent") or record.get("intent")
+        if not scenario or not intent:
+            raise AdapterError("LangChain trace requires agent_eval.scenario and agent_eval.intent metadata")
+        events = record.get("events", [record])
+        if not isinstance(events, list):
+            events = [record]
+        calls: list[ToolCall] = []
+        answer = record.get("answer")
+        for event in events:
+            if not isinstance(event, dict):
+                continue
+            event_name = event.get("event", "")
+            data = event.get("data", {})
+            if event_name in {"on_tool_start", "on_tool_end"} or event.get("type") == "tool":
+                tool_name = event.get("name") or event.get("name", "")
+                args = data.get("input", {}) if isinstance(data, dict) else {}
+                if event_name == "on_tool_start" and tool_name:
+                    calls.append(ToolCall(str(tool_name), args if isinstance(args, dict) else {}))
+            if event_name in {"on_chain_end", "on_chat_model_end"} and isinstance(data, dict):
+                output = data.get("output")
+                if isinstance(output, str):
+                    answer = output
+        return AgentResult(scenario=str(scenario), intent=str(intent),
+                           tools=tuple(call.name for call in calls), tool_calls=tuple(calls),
+                           answer=answer if isinstance(answer, str) else None,
+                           metadata={"framework": "langchain", "model": metadata.get("ls_model_name")})
 
 
 _PATH_TOKEN = re.compile(r"[^.\[\]]+|\[\*\]|\[\d+\]")
@@ -205,6 +273,7 @@ def result_as_dict(result: AgentResult) -> dict[str, Any]:
         ],
         "notes": result.notes,
         "answer": result.answer,
+        "metadata": result.metadata,
     }
     if result.turns:
         output["turns"] = [
@@ -220,6 +289,7 @@ def result_as_dict(result: AgentResult) -> dict[str, Any]:
                 "events": [{"type": event.event_type, "name": event.name} for event in turn.events],
                 "answer": turn.answer,
                 "notes": turn.notes,
+                "metadata": turn.metadata,
             }
             for turn in result.turns
         ]

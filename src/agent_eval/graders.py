@@ -8,6 +8,8 @@ from hashlib import sha256
 from importlib.metadata import entry_points
 import json
 from typing import Any, Protocol
+from pathlib import Path
+from statistics import mean, pstdev
 
 from agent_eval.models import AgentResult, GradeResult, Scenario
 
@@ -175,7 +177,10 @@ def grade_answer(
     result: AgentResult,
     registry: Mapping[str, AnswerGrader],
     judges: Mapping[str, SemanticJudge] | None = None,
+    *, judge_cache: Path | None = None, judge_repetitions: int = 1,
 ) -> tuple[GradeResult, ...]:
+    if judge_repetitions < 1:
+        raise GraderError("judge repetitions must be at least one")
     grades: list[GradeResult] = []
     for spec in scenario.answer_graders:
         grader_name = spec["type"]
@@ -207,18 +212,44 @@ def grade_answer(
                 rubric=rubric,
                 model=model,
             )
-            try:
-                output = judge.judge(request)
-            except Exception as exc:
-                raise GraderError(f"semantic judge '{judge_name}' failed for '{scenario.name}': {exc}") from exc
-            if not isinstance(output, GradeResult):
-                raise GraderError(f"semantic judge '{judge_name}' must return a GradeResult")
-            if isinstance(output.score, bool) or not isinstance(output.score, (int, float)) or not 0 <= output.score <= 1:
-                raise GraderError(f"semantic judge '{judge_name}' returned a score outside [0, 1]")
-            if not isinstance(output.metadata, Mapping):
-                raise GraderError(f"semantic judge '{judge_name}' metadata must be a mapping")
-            if not isinstance(output.feedback, str):
-                raise GraderError(f"semantic judge '{judge_name}' feedback must be a string rationale")
+            cache_key = sha256(json.dumps({"request": request.__dict__, "judge": judge_name,
+                                           "version": str(getattr(judge, "version", "unspecified"))},
+                                          sort_keys=True, ensure_ascii=False, default=str).encode()).hexdigest()
+            cache = {}
+            if judge_cache and judge_cache.exists():
+                try:
+                    cache = json.loads(judge_cache.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError) as exc:
+                    raise GraderError(f"could not read judge cache {judge_cache}: {exc}") from exc
+                if not isinstance(cache, dict):
+                    raise GraderError(f"judge cache {judge_cache} must contain a JSON object")
+            outputs = []
+            for repeat_index in range(judge_repetitions):
+                key = f"{cache_key}:{repeat_index}"
+                cached = cache.get(key)
+                if isinstance(cached, dict):
+                    output = GradeResult(grader="llm_judge", score=float(cached["score"]),
+                                         passed=bool(cached.get("passed", False)),
+                                         feedback=str(cached.get("feedback", "")),
+                                         metadata=dict(cached.get("metadata", {})))
+                else:
+                    try:
+                        output = judge.judge(request)
+                    except Exception as exc:
+                        raise GraderError(f"semantic judge '{judge_name}' failed for '{scenario.name}': {exc}") from exc
+                if not isinstance(output, GradeResult):
+                    raise GraderError(f"semantic judge '{judge_name}' must return a GradeResult")
+                if isinstance(output.score, bool) or not isinstance(output.score, (int, float)) or not 0 <= output.score <= 1:
+                    raise GraderError(f"semantic judge '{judge_name}' returned a score outside [0, 1]")
+                if not isinstance(output.metadata, Mapping) or not isinstance(output.feedback, str):
+                    raise GraderError(f"semantic judge '{judge_name}' returned invalid metadata or rationale")
+                if judge_cache and key not in cache:
+                    cache[key] = {"score": output.score, "passed": output.passed,
+                                  "feedback": output.feedback, "metadata": output.metadata}
+                    judge_cache.parent.mkdir(parents=True, exist_ok=True)
+                    judge_cache.write_text(json.dumps(cache, indent=2, ensure_ascii=False), encoding="utf-8")
+                outputs.append(output)
+            output = outputs[0]
             threshold = spec.get("threshold", 0.7)
             if isinstance(threshold, bool) or not isinstance(threshold, (int, float)) or not 0 <= threshold <= 1:
                 raise GraderError("llm_judge threshold must be a number between 0 and 1")
@@ -230,12 +261,17 @@ def grade_answer(
                 "model": output.metadata.get("model", model),
                 "grader_version": str(getattr(judge, "version", "unspecified")),
                 "rubric_sha256": fingerprint,
+                "repeated_scores": [float(item.score) for item in outputs],
+                "score_stddev": pstdev(float(item.score) for item in outputs) if len(outputs) > 1 else 0.0,
+                "judge_agreement": (sum(item.passed == outputs[0].passed for item in outputs) / len(outputs)),
+                "cache": "enabled" if judge_cache else "disabled",
             }
+            score = mean(float(item.score) for item in outputs)
             grades.append(GradeResult(
                 grader=grader_name,
-                score=float(output.score),
-                passed=float(output.score) >= float(threshold),
-                feedback=output.feedback,
+                score=score,
+                passed=score >= float(threshold),
+                feedback="\n".join(dict.fromkeys(item.feedback for item in outputs)),
                 rubric=dict(spec),
                 metadata=metadata,
             ))

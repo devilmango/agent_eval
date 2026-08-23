@@ -153,6 +153,16 @@ def load_scenario(path: Path) -> Scenario:
     tags = _string_list(document.get("tags"), "tags", path)
     if len({tag.casefold() for tag in tags}) != len(tags):
         raise ScenarioError(f"{path}: 'tags' must not contain duplicates")
+    fixtures = document.get("tool_fixtures", [])
+    if not isinstance(fixtures, list) or any(
+        not isinstance(item, dict) or not isinstance(item.get("name"), str)
+        or ("response" not in item and "error" not in item)
+        for item in fixtures
+    ):
+        raise ScenarioError(f"{path}: 'tool_fixtures' must be a list of mappings with name and response")
+    for index, fixture in enumerate(fixtures):
+        if not isinstance(fixture.get("arguments", {}), dict):
+            raise ScenarioError(f"{path}: 'tool_fixtures[{index}].arguments' must be a mapping")
 
     return Scenario(
         name=name,
@@ -169,6 +179,7 @@ def load_scenario(path: Path) -> Scenario:
         tags=tags,
         source=str(path),
         turns=tuple(turns),
+        tool_fixtures=tuple(fixtures),
     )
 
 

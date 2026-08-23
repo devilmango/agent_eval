@@ -5,9 +5,63 @@ from __future__ import annotations
 from collections import Counter
 from dataclasses import replace
 from typing import Any
+from pathlib import Path
+import json
 
 from agent_eval.models import AgentResult, Scenario, ToolCall, TraceEvent
 from agent_eval.scoring import score_scenario
+
+
+def scenario_suggestions(scenarios: list[Scenario], *, limit: int = 20) -> dict[str, Any]:
+    """Return deterministic, review-only candidates; no new oracle labels are invented."""
+    coverage = scenario_coverage(scenarios)
+    checks = coverage["checks"]
+    gaps = [name for name in ("required_question_scenarios", "tool_scenarios", "policy_scenarios", "answer_graded_scenarios", "multi_turn_scenarios") if checks[name] == 0]
+    candidates = []
+    for scenario in scenarios:
+        user_text = next((value for value in scenario.input.values() if isinstance(value, str)), None)
+        if user_text:
+            candidates.append({"scenario": scenario.name, "kind": "paraphrase_review", "input_variant": "Please help me with this request: " + user_text,
+                              "oracle": "Review expected behavior before adopting; labels are intentionally not inferred."})
+        for gap in gaps:
+            candidates.append({"scenario": scenario.name, "kind": "coverage_gap", "dimension": gap,
+                               "candidate": f"Add a reviewed scenario that asserts {gap.replace('_', ' ')} behavior.",
+                               "oracle": "Human-authored expected behavior required."})
+    return {"coverage": coverage, "review_required": True, "candidates": candidates[:limit]}
+
+
+def judge_agreement(paths: list[Path]) -> dict[str, Any]:
+    """Compare per-scenario judge outcomes in saved JSON evaluation reports."""
+    if len(paths) < 2:
+        raise ValueError("judge-agreement requires at least two report files")
+    by_scenario: dict[str, list[dict[str, Any]]] = {}
+    for path in paths:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(f"could not read evaluation report {path}: {exc}") from exc
+        rows = data.get("scenarios") if isinstance(data, dict) else None
+        if not isinstance(rows, list):
+            raise ValueError(f"{path}: expected an Agent Eval JSON report with scenarios")
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            grades = row.get("answer_grades", [])
+            judges = [grade for grade in grades if isinstance(grade, dict) and grade.get("metadata", {}).get("judge")]
+            if judges:
+                by_scenario.setdefault(str(row.get("scenario")), []).extend(judges)
+    outcomes = []
+    for scenario, grades in sorted(by_scenario.items()):
+        decisions = [bool(grade.get("passed")) for grade in grades]
+        scores = [float(grade["score"]) for grade in grades if isinstance(grade.get("score"), (int, float))]
+        outcomes.append({"scenario": scenario, "judgments": len(grades),
+                         "agreement": max(decisions.count(True), decisions.count(False)) / len(decisions),
+                         "score_range": max(scores) - min(scores) if scores else None,
+                         "judges": sorted({grade["metadata"].get("judge", "unknown") for grade in grades})})
+    decisions = [item["agreement"] for item in outcomes]
+    return {"reports": [str(path) for path in paths], "scenario_count": len(outcomes),
+            "mean_majority_agreement": sum(decisions) / len(decisions) if decisions else None,
+            "scenarios": outcomes}
 
 
 def scenario_coverage(scenarios: list[Scenario]) -> dict[str, Any]:

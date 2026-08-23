@@ -67,6 +67,11 @@ def analyze_repeated_runs(
         metrics[metric] = _statistics(observed) if observed else {
             "mean": None, "sample_stddev": None, "min": None, "max": None
         }
+    execution: dict[str, Any] = {}
+    for metric in ("latency_ms", "input_tokens", "output_tokens", "cost_usd"):
+        values = [report.execution.get(metric, {}).get("total") for report in reports]
+        observed = [value for value in values if isinstance(value, (int, float))]
+        execution[metric] = _statistics(observed) if observed else {"mean": None, "sample_stddev": None, "min": None, "max": None}
 
     scenario_rows: list[dict[str, Any]] = []
     for name in scenario_names:
@@ -97,6 +102,7 @@ def analyze_repeated_runs(
         "pass_rate": {**_statistics(pass_rates), "confidence_interval": {"lower": lower, "upper": upper}},
         "run_pass_rates": pass_rates,
         "metrics": metrics,
+        "execution": execution,
         "scenarios": scenario_rows,
     }
 

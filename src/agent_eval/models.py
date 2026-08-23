@@ -55,6 +55,7 @@ class AgentTurnResult:
     events: tuple[TraceEvent, ...] = ()
     answer: str | None = None
     notes: str = ""
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -77,6 +78,7 @@ class Scenario:
     tags: tuple[str, ...] = ()
     source: str = ""
     turns: tuple[ScenarioTurn, ...] = ()
+    tool_fixtures: tuple[dict[str, Any], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -91,6 +93,7 @@ class AgentResult:
     answer: str | None = None
     notes: str = ""
     turns: tuple[AgentTurnResult, ...] = ()
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -126,6 +129,7 @@ class EvaluationReport:
     unnecessary_question_rate: float
     answer_quality_score: float | None = None
     scores: tuple[ScenarioScore, ...] = field(default_factory=tuple)
+    execution: dict[str, Any] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -140,4 +144,5 @@ class EvaluationReport:
                 "answer_quality_score": self.answer_quality_score,
             },
             "scenarios": [score.as_dict() for score in self.scores],
+            "execution": self.execution,
         }

@@ -79,7 +79,10 @@ def _turn_results(value: Any, line: int) -> tuple[AgentTurnResult, ...]:
             events=_events(item.get("events"), line),
             answer=item.get("answer"),
             notes=item.get("notes", ""),
+            metadata=item.get("metadata", {}),
         ))
+        if not isinstance(turns[-1].metadata, dict):
+            raise ResultError(f"line {line}: '{label}.metadata' must be an object")
         if turns[-1].answer is not None and not isinstance(turns[-1].answer, str):
             raise ResultError(f"line {line}: '{label}.answer' must be a string")
         if not isinstance(turns[-1].notes, str):
@@ -136,6 +139,9 @@ def load_results(path: Path) -> dict[str, AgentResult]:
         answer = item.get("answer", turns[-1].answer if turns else None)
         if answer is not None and not isinstance(answer, str):
             raise ResultError(f"line {line_number}: 'answer' must be a string")
+        metadata = item.get("metadata", {})
+        if not isinstance(metadata, dict):
+            raise ResultError(f"line {line_number}: 'metadata' must be an object")
         results[scenario] = AgentResult(
             scenario=scenario,
             intent=intent,
@@ -147,5 +153,6 @@ def load_results(path: Path) -> dict[str, AgentResult]:
             answer=answer,
             notes=notes,
             turns=turns,
+            metadata=metadata,
         )
     return results
