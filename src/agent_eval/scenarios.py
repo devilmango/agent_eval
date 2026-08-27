@@ -163,6 +163,9 @@ def load_scenario(path: Path) -> Scenario:
     for index, fixture in enumerate(fixtures):
         if not isinstance(fixture.get("arguments", {}), dict):
             raise ScenarioError(f"{path}: 'tool_fixtures[{index}].arguments' must be a mapping")
+    scenario_version = document.get("version", 1)
+    if isinstance(scenario_version, bool) or not isinstance(scenario_version, int) or scenario_version < 1:
+        raise ScenarioError(f"{path}: 'version' must be a positive integer")
 
     return Scenario(
         name=name,
@@ -180,6 +183,7 @@ def load_scenario(path: Path) -> Scenario:
         source=str(path),
         turns=tuple(turns),
         tool_fixtures=tuple(fixtures),
+        version=scenario_version,
     )
 
 
@@ -191,7 +195,8 @@ def load_scenarios(path: Path) -> list[Scenario]:
         files = sorted(
             candidate
             for candidate in path.rglob("*")
-            if candidate.is_file() and candidate.suffix.lower() in {".yaml", ".yml"}
+            if candidate.is_file() and candidate.name not in {"scenario-set.yaml", "scenario-set.yml"}
+            and candidate.suffix.lower() in {".yaml", ".yml"}
         )
     else:
         raise ScenarioError(f"Scenario path does not exist: {path}")

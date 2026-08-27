@@ -26,6 +26,13 @@ def text_report(report: EvaluationReport, *, details: bool = True) -> str:
         f"Unnecessary questions: {format_percent(report.unnecessary_question_rate)}",
         f"Answer quality:        {format_percent(report.answer_quality_score)}",
     ]
+    budget_gates = report.execution.get("budget_gates", {})
+    if budget_gates:
+        lines.extend(["", "Execution budgets:"])
+        for name, gate in budget_gates.items():
+            observed = "missing" if gate["observed"] is None else str(gate["observed"])
+            status = "PASS" if gate["passed"] else "FAIL"
+            lines.append(f"  {status} {name}: {observed} (limit {gate['limit']}; missing scenarios {gate['missing_scenarios']})")
     if details and report.failed:
         lines.extend(["", "Failures:"])
         for score in report.scores:
@@ -66,6 +73,16 @@ def html_report(report: EvaluationReport) -> str:
             ("Unnecessary questions", report.unnecessary_question_rate),
             ("Answer quality", report.answer_quality_score),
         )
+    )
+    budget_gates = report.execution.get("budget_gates", {})
+    budget_rows = "".join(
+        "<tr>"
+        f"<th scope=\"row\">{escape(name)}</th>"
+        f"<td>{escape('missing' if gate['observed'] is None else str(gate['observed']))}</td>"
+        f"<td>{escape(str(gate['limit']))}</td>"
+        f"<td>{'Passed' if gate['passed'] else 'Failed'} ({gate['missing_scenarios']} missing)</td>"
+        "</tr>"
+        for name, gate in budget_gates.items()
     )
     scenario_rows = []
     for score in report.scores:
@@ -124,6 +141,7 @@ def html_report(report: EvaluationReport) -> str:
             <tbody>{''.join(scenario_rows)}</tbody>
           </table>
         </section>
+        {f'<section aria-labelledby="budgets-heading"><h2 id="budgets-heading">Execution budgets</h2><table><caption>Measured values compared with configured limits</caption><thead><tr><th scope="col">Metric</th><th scope="col">Observed</th><th scope="col">Limit</th><th scope="col">Gate</th></tr></thead><tbody>{budget_rows}</tbody></table></section>' if budget_gates else ''}
         """,
     )
 

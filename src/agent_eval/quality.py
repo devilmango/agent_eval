@@ -64,6 +64,75 @@ def judge_agreement(paths: list[Path]) -> dict[str, Any]:
             "scenarios": outcomes}
 
 
+def failure_analysis(scenarios: list[Scenario], report: Any,
+                     results: dict[str, AgentResult]) -> dict[str, Any]:
+    """Cluster failures and summarize pass rates by intent, tag, model, and prompt."""
+    scenario_by_name = {scenario.name: scenario for scenario in scenarios}
+    clusters: dict[str, set[str]] = {}
+    slices: dict[str, dict[str, set[str]]] = {}
+
+    def add_slice(dimension: str, value: str, name: str) -> None:
+        slices.setdefault(dimension, {}).setdefault(value, set()).add(name)
+
+    for score in report.scores:
+        scenario = scenario_by_name[score.scenario]
+        result = results.get(score.scenario)
+        if not score.passed:
+            reasons: list[str] = []
+            if result is None:
+                reasons.append("missing_result")
+            if not score.intent_correct:
+                reasons.append("wrong_intent")
+            reasons.extend(f"missing_question:{name}" for name in score.missing_questions)
+            reasons.extend(f"unnecessary_question:{name}" for name in score.unnecessary_questions)
+            if score.tool_correct is False:
+                reasons.extend("tool_mismatch:" + detail for detail in (score.tool_call_mismatches or ("tool selection",)))
+            reasons.extend("policy_violation:" + detail for detail in score.policy_violations)
+            reasons.extend("answer_grader:" + grade.grader for grade in score.answer_grades if not grade.passed)
+            reasons.extend("turn_failure:" + detail for detail in score.turn_violations)
+            if not reasons:
+                reasons.append("other_failure")
+            for reason in reasons:
+                clusters.setdefault(reason, set()).add(score.scenario)
+        add_slice("intent", scenario.intent, scenario.name)
+        for tag in scenario.tags:
+            add_slice("tag", tag, scenario.name)
+        if result:
+            for dimension in ("model", "prompt_version"):
+                value = result.metadata.get(dimension)
+                if value is not None:
+                    add_slice(dimension, str(value), scenario.name)
+
+    score_by_name = {score.scenario: score for score in report.scores}
+    cluster_rows = [{"reason": reason, "scenario_count": len(names), "scenarios": sorted(names)}
+                    for reason, names in sorted(clusters.items(), key=lambda item: (-len(item[1]), item[0]))]
+    slice_rows: dict[str, list[dict[str, Any]]] = {}
+    for dimension, groups in sorted(slices.items()):
+        rows = []
+        for value, names in sorted(groups.items()):
+            passed = sum(score_by_name[name].passed for name in names)
+            rows.append({"value": value, "scenario_count": len(names), "passed": passed,
+                         "failed": len(names) - passed,
+                         "pass_rate": passed / len(names) if names else 0.0,
+                         "failed_scenarios": sorted(name for name in names if not score_by_name[name].passed)})
+        slice_rows[dimension] = rows
+    return {"scenario_count": report.total, "failed_scenarios": report.failed,
+            "failure_clusters": cluster_rows, "slices": slice_rows}
+
+
+def text_failure_analysis(analysis: dict[str, Any]) -> str:
+    lines = [f"Failure analysis: {analysis['failed_scenarios']}/{analysis['scenario_count']} scenarios failed", "", "Failure clusters:"]
+    if analysis["failure_clusters"]:
+        for row in analysis["failure_clusters"]:
+            lines.append(f"  {row['reason']}: {row['scenario_count']} ({', '.join(row['scenarios'])})")
+    else:
+        lines.append("  none")
+    for dimension, rows in analysis["slices"].items():
+        lines.extend(["", dimension.replace("_", " ").capitalize() + " slices:"])
+        lines.extend(f"  {row['value']}: {row['passed']}/{row['scenario_count']} passed ({row['pass_rate'] * 100:.1f}%)" for row in rows)
+    return "\n".join(lines)
+
+
 def scenario_coverage(scenarios: list[Scenario]) -> dict[str, Any]:
     """Summarize which behavior dimensions are explicitly represented."""
     intents = Counter(scenario.intent for scenario in scenarios)

@@ -23,6 +23,9 @@ The core package has no model-provider or agent-framework dependency. Optional r
 - **Execution metadata** — optional model, prompt version, latency, token, and cost fields flow into reports and repeated-run trend summaries.
 - **Judge calibration** — cache repeated semantic judgments, inspect score stability, and compare judge decisions across saved reports.
 - **Coverage-guided suggestions** — generate review-only test candidates from coverage gaps without inventing expected labels.
+- **Scenario version audits** — snapshot scenario contracts, detect breaking edits, and migrate scenario-set and per-scenario versions.
+- **Failure triage and slices** — group regressions by cause and compare pass rates by intent, tag, model, and prompt version.
+- **Execution budgets** — gate total cost/tokens and p95 scenario latency in local runs or CI.
 
 Built-in checks are deterministic and work over structured traces. Semantic judges are opt-in plugins; the core does not make provider calls or require model credentials.
 
@@ -177,6 +180,7 @@ tags: [scheduling, safety]
 | Field | Required | Description |
 | --- | --- | --- |
 | `scenario` | Yes | Unique ID used to match the agent result. |
+| `version` | No | Positive integer scenario contract version; defaults to `1` and should increase when its expected behavior changes. |
 | `input` | Yes | Non-empty mapping passed to your agent adapter. |
 | `expected.intent` | Yes | Expected intent label. Comparison ignores letter case. |
 | `expected.must_ask` | No | Question identifiers the agent must ask. A missing required question fails the scenario. |
@@ -187,6 +191,22 @@ tags: [scheduling, safety]
 | `expected.answer_graders` | No | Deterministic checks or installed grader plugins applied to the agent's final answer. |
 | `tags` | No | Labels for selecting related scenarios from the CLI. |
 | `turns` | No | Ordered conversation inputs with optional expectations for each turn. Use instead of `input`. |
+
+Version the set with `scenarios/scenario-set.yaml`:
+
+```yaml
+scenario_set: support-agent
+version: 1.2.0
+schema_version: 1
+```
+
+`agent-eval scenario-version scenarios/ --format json --output snapshot.json` records stable scenario IDs, per-scenario versions, and contract hashes. Compare that snapshot with the last approved snapshot to classify added, removed, or changed contracts and enforce a semantic version bump:
+
+```bash
+agent-eval scenario-version scenarios/ --baseline approved-scenarios.json
+```
+
+Breaking contract changes recommend a major set version and require an increment to the changed scenario's `version`. Additions recommend a minor version; no contract changes recommend a patch. To migrate changed scenario versions and write the recommended set version in one step, use `--migrate` with a baseline. For a legacy/missing manifest, `--write-manifest` writes the current manifest schema. Snapshots contain hashes rather than scenario input contents.
 
 For a multi-turn scenario, use `turns` instead of `input`. Top-level `expected` fields check the aggregate conversation and final intent; each turn can add specific assertions:
 
@@ -286,6 +306,24 @@ agent-eval run scenarios/ --responses run.jsonl --format json > report.json
 ```
 
 Use `--strict` to return an input error when any scenario result is missing. Without it, missing results appear as failed scenarios in the report. Unknown and duplicate scenario IDs in the result file are always input errors. Use `--quiet-details` to print only the text summary.
+
+Set execution budgets to fail the run when a measured limit is exceeded or a requested metric is absent:
+
+```bash
+agent-eval run scenarios/ --responses run.jsonl \
+  --max-cost-usd 2.00 --max-input-tokens 50000 --max-output-tokens 12000 \
+  --max-p95-latency-ms 1500
+```
+
+Cost and token limits apply to totals across the selected scenarios. Latency uses the nearest-rank p95 across per-scenario `metadata.latency_ms` values. Gate results appear in text, JSON, and HTML reports; any failed budget returns exit code `1`. The same options are available for `run-agent`.
+
+Cluster and slice failures to find common regressions:
+
+```bash
+agent-eval triage scenarios/ --responses run.jsonl --format json
+```
+
+The report groups failures by cause and summarizes pass rates by expected intent, scenario tag, and available model/prompt metadata. `triage` is informational and returns `0` after producing the report.
 
 Semantic judges can be repeated and cached during evaluation. Cache files should be treated as evaluation artifacts because they contain judge scores, rationales, and request fingerprints:
 

@@ -10,17 +10,19 @@ from typing import Any
 
 from agent_eval import __version__
 from agent_eval.adapters import AdapterError, PathMappingAdapter, load_adapter_plugin, result_as_dict
+from agent_eval.budgets import apply_budgets
 from agent_eval.comparison import compare_reports, text_comparison
 from agent_eval.graders import GraderError
 from agent_eval.models import AgentResult
 from agent_eval.otel import OpenTelemetryAdapter, load_otel_document
-from agent_eval.quality import mutation_report, scenario_coverage, scenario_suggestions, judge_agreement, text_coverage, text_mutation_report
+from agent_eval.quality import failure_analysis, mutation_report, scenario_coverage, scenario_suggestions, judge_agreement, text_coverage, text_mutation_report, text_failure_analysis
 from agent_eval.report import html_report, json_report, repeated_html_report, text_report
 from agent_eval.repeated import analyze_repeated_runs, text_repeated_report
 from agent_eval.results import ResultError, load_results
 from agent_eval.runner import RunnerError, execute_scenarios, load_runner
 from agent_eval.scenarios import ScenarioError, filter_scenarios, load_scenarios
 from agent_eval.scoring import evaluate
+from agent_eval.versioning import VersioningError, compare_snapshots, migrate_scenario_versions, snapshot as scenario_snapshot, text_version_report, write_manifest
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -44,6 +46,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--quiet-details", action="store_true", help="hide per-scenario failure details")
     run.add_argument("--judge-cache", type=Path, help="cache semantic judge results in this JSON file")
     run.add_argument("--judge-repetitions", type=int, default=1, help="repeat semantic judgments for stability (default: 1)")
+    _add_budget_arguments(run)
     _add_tag_filters(run)
 
     adapt = commands.add_parser("adapt", help="convert framework JSONL traces into Agent Eval results")
@@ -97,6 +100,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_agent.add_argument("--format", choices=("text", "json", "html"), default="text")
     run_agent.add_argument("--judge-cache", type=Path, help="cache semantic judge results in this JSON file")
     run_agent.add_argument("--judge-repetitions", type=int, default=1, help="repeat semantic judgments for stability (default: 1)")
+    _add_budget_arguments(run_agent)
     _add_tag_filters(run_agent)
 
     coverage = commands.add_parser("coverage", help="summarize behavior dimensions declared by scenarios")
@@ -113,6 +117,21 @@ def build_parser() -> argparse.ArgumentParser:
     audit.add_argument("reports", nargs="+", type=Path)
     audit.add_argument("--output", type=Path)
 
+    triage = commands.add_parser("triage", help="cluster evaluation failures and report performance slices")
+    triage.add_argument("scenarios", type=Path)
+    triage.add_argument("--responses", required=True, type=Path)
+    triage.add_argument("--format", choices=("text", "json"), default="text")
+    triage.add_argument("--output", type=Path)
+    _add_tag_filters(triage)
+
+    version = commands.add_parser("scenario-version", help="snapshot or compare a versioned scenario set")
+    version.add_argument("scenarios", type=Path)
+    version.add_argument("--baseline", type=Path, help="previous scenario-version JSON snapshot")
+    version.add_argument("--format", choices=("text", "json"), default="text")
+    version.add_argument("--output", type=Path)
+    version.add_argument("--write-manifest", action="store_true", help="migrate/write scenario-set.yaml")
+    version.add_argument("--migrate", action="store_true", help="bump changed scenario versions and write the recommended set version")
+
     mutate = commands.add_parser("mutate", help="check whether scenarios catch representative trace regressions")
     mutate.add_argument("scenarios", type=Path, help="scenario YAML file or directory")
     mutate.add_argument("--responses", required=True, type=Path, help="canonical JSONL agent results")
@@ -125,6 +144,13 @@ def build_parser() -> argparse.ArgumentParser:
 def _add_tag_filters(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--tag", action="append", default=[], help="include scenarios matching any tag; repeatable")
     parser.add_argument("--exclude-tag", action="append", default=[], help="exclude scenarios with this tag; repeatable")
+
+
+def _add_budget_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--max-cost-usd", type=float, help="fail if total recorded run cost exceeds this amount")
+    parser.add_argument("--max-input-tokens", type=int, help="fail if total input tokens exceed this count")
+    parser.add_argument("--max-output-tokens", type=int, help="fail if total output tokens exceed this count")
+    parser.add_argument("--max-p95-latency-ms", type=float, help="fail if nearest-rank p95 scenario latency exceeds this value")
 
 
 def _adapt_jsonl(input_path: Path, adapter: PathMappingAdapter) -> list[str]:
@@ -204,6 +230,35 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         all_scenarios = load_scenarios(args.scenarios)
+        if args.command == "scenario-version":
+            scenario_dir = args.scenarios if args.scenarios.is_dir() else args.scenarios.parent
+            current = scenario_snapshot(all_scenarios, scenario_dir)
+            compatibility = None
+            if args.baseline:
+                try:
+                    baseline = json.loads(args.baseline.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError) as exc:
+                    raise VersioningError(f"could not read baseline snapshot {args.baseline}: {exc}") from exc
+                if not isinstance(baseline, dict) or not isinstance(baseline.get("scenarios"), list):
+                    raise VersioningError(f"{args.baseline}: not an Agent Eval scenario snapshot")
+                compatibility = compare_snapshots(current, baseline)
+            if args.migrate:
+                if not args.baseline:
+                    raise VersioningError("--migrate requires --baseline")
+                migrate_scenario_versions(all_scenarios, baseline)
+                selected_version = compatibility["recommended_version"]
+                write_manifest(scenario_dir, current, selected_version)
+                all_scenarios = load_scenarios(args.scenarios)
+                current = scenario_snapshot(all_scenarios, scenario_dir)
+                compatibility = compare_snapshots(current, baseline)
+            elif args.write_manifest:
+                selected_version = compatibility["recommended_version"] if compatibility else current["version"]
+                write_manifest(scenario_dir, current, selected_version)
+                current = scenario_snapshot(all_scenarios, scenario_dir)
+            payload = {**current, "compatibility": compatibility}
+            rendered = json.dumps(payload, indent=2, ensure_ascii=False) if args.format == "json" else text_version_report(current, compatibility)
+            _write_output(args.output, rendered)
+            return 1 if compatibility and (not compatibility["version_sufficient"] or compatibility["unversioned_changes"]) else 0
         if args.command == "coverage":
             report = scenario_coverage(all_scenarios)
             rendered = json.dumps(report, indent=2, ensure_ascii=False) if args.format == "json" else text_coverage(report)
@@ -235,6 +290,14 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 print(text_comparison(comparison))
             return 0 if not comparison["regressed_scenarios"] else 1
+
+        if args.command == "triage":
+            results = _selected_results(args.responses, all_scenarios, scenarios)
+            report = evaluate(scenarios, results, strict=False)
+            analysis = failure_analysis(scenarios, report, results)
+            rendered = json.dumps(analysis, indent=2, ensure_ascii=False) if args.format == "json" else text_failure_analysis(analysis)
+            _write_output(args.output, rendered)
+            return 0
 
         if args.command == "mutate":
             report = mutation_report(scenarios, _selected_results(args.responses, all_scenarios, scenarios))
@@ -281,6 +344,10 @@ def main(argv: list[str] | None = None) -> int:
             )
             report = evaluate(scenarios, {result.scenario: result for result in results}, strict=True,
                               judge_cache=args.judge_cache, judge_repetitions=args.judge_repetitions)
+            report, budgets_passed = apply_budgets(
+                report, {result.scenario: result for result in results}, len(scenarios),
+                max_cost_usd=args.max_cost_usd, max_input_tokens=args.max_input_tokens,
+                max_output_tokens=args.max_output_tokens, max_p95_latency_ms=args.max_p95_latency_ms)
             if args.format == "json":
                 rendered = json_report(report)
             elif args.format == "html":
@@ -288,11 +355,15 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 rendered = text_report(report)
             _write_output(args.report, rendered)
-            return 0 if report.failed == 0 else 1
+            return 0 if report.failed == 0 and budgets_passed else 1
 
         results = _selected_results(args.responses, all_scenarios, scenarios)
         report = evaluate(scenarios, results, strict=args.strict,
                           judge_cache=args.judge_cache, judge_repetitions=args.judge_repetitions)
+        report, budgets_passed = apply_budgets(
+            report, results, len(scenarios), max_cost_usd=args.max_cost_usd,
+            max_input_tokens=args.max_input_tokens, max_output_tokens=args.max_output_tokens,
+            max_p95_latency_ms=args.max_p95_latency_ms)
     except (AdapterError, GraderError, RunnerError, ScenarioError, ResultError, OSError, ValueError) as exc:
         print(f"agent-eval: error: {exc}", file=sys.stderr)
         return 2
@@ -304,7 +375,7 @@ def main(argv: list[str] | None = None) -> int:
     else:
         rendered = text_report(report, details=not args.quiet_details)
     _write_output(args.output, rendered)
-    return 0 if report.failed == 0 else 1
+    return 0 if report.failed == 0 and budgets_passed else 1
 
 
 def _write_output(path: Path | None, content: str) -> None:

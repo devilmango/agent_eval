@@ -1,0 +1,1 @@
+{"scenario":"clinic_hours","intent":"OFFICE_HOURS","asked":[],"tools":["lookup_clinic_hours"],"actions":[],"answer":"The clinic closes at 5 PM today.","metadata":{"model":"example-model","prompt_version":"example-v1","latency_ms":120,"input_tokens":42,"output_tokens":18,"cost_usd":0.001}}

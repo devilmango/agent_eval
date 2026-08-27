@@ -79,6 +79,7 @@ class Scenario:
     source: str = ""
     turns: tuple[ScenarioTurn, ...] = ()
     tool_fixtures: tuple[dict[str, Any], ...] = ()
+    version: int = 1
 
 
 @dataclass(frozen=True)
