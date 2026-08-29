@@ -20,7 +20,9 @@ jobs:
       - name: Run validation suite
         run: python -m unittest discover -s tests -v
       - name: Validate sample run and create HTML report
-        run: agent-eval run scenarios/ --responses examples/responses.jsonl --strict --format html --output agent-eval-report.html
+        run: agent-eval run scenarios/ --responses examples/responses.jsonl --strict --format html --output agent-eval-report.html --bundle-dir agent-eval-bundle
+      - name: Verify reproducible run bundle
+        run: agent-eval verify-bundle agent-eval-bundle
       - name: Check repeated-run confidence gate
         run: agent-eval repeat scenarios/ --runs examples/responses.jsonl examples/responses.jsonl --min-runs 2 --confidence 0.95 --min-pass-rate 0.60 --strict --format html --output agent-eval-stability.html
       - name: Audit scenario coverage and mutation sensitivity
@@ -45,4 +47,5 @@ jobs:
             agent-eval-scenario-version.json
             agent-eval-triage.json
             agent-eval-budget.json
+            agent-eval-bundle/
           if-no-files-found: ignore

@@ -9,10 +9,12 @@ from pathlib import Path
 from typing import Any
 
 from agent_eval import __version__
+from agent_eval.bundles import BundleError, create_bundle, verify_bundle
+from agent_eval.calibration import CalibrationError, calibrate_judge, text_calibration_report
 from agent_eval.adapters import AdapterError, PathMappingAdapter, load_adapter_plugin, result_as_dict
 from agent_eval.budgets import apply_budgets
 from agent_eval.comparison import compare_reports, text_comparison
-from agent_eval.graders import GraderError
+from agent_eval.graders import GraderError, load_judge_registry
 from agent_eval.models import AgentResult
 from agent_eval.otel import OpenTelemetryAdapter, load_otel_document
 from agent_eval.quality import failure_analysis, mutation_report, scenario_coverage, scenario_suggestions, judge_agreement, text_coverage, text_mutation_report, text_failure_analysis
@@ -46,6 +48,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--quiet-details", action="store_true", help="hide per-scenario failure details")
     run.add_argument("--judge-cache", type=Path, help="cache semantic judge results in this JSON file")
     run.add_argument("--judge-repetitions", type=int, default=1, help="repeat semantic judgments for stability (default: 1)")
+    run.add_argument("--bundle-dir", type=Path, help="write a self-contained, hash-verified run bundle to a new directory")
     _add_budget_arguments(run)
     _add_tag_filters(run)
 
@@ -100,6 +103,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_agent.add_argument("--format", choices=("text", "json", "html"), default="text")
     run_agent.add_argument("--judge-cache", type=Path, help="cache semantic judge results in this JSON file")
     run_agent.add_argument("--judge-repetitions", type=int, default=1, help="repeat semantic judgments for stability (default: 1)")
+    run_agent.add_argument("--bundle-dir", type=Path, help="write a self-contained, hash-verified run bundle to a new directory")
     _add_budget_arguments(run_agent)
     _add_tag_filters(run_agent)
 
@@ -131,6 +135,20 @@ def build_parser() -> argparse.ArgumentParser:
     version.add_argument("--output", type=Path)
     version.add_argument("--write-manifest", action="store_true", help="migrate/write scenario-set.yaml")
     version.add_argument("--migrate", action="store_true", help="bump changed scenario versions and write the recommended set version")
+
+    calibrate = commands.add_parser("calibrate-judge", help="measure a semantic judge against human-labeled gold examples")
+    calibrate.add_argument("gold_set", type=Path, help="YAML gold set")
+    calibrate.add_argument("--judge", required=True, help="semantic judge plugin entry-point name")
+    calibrate.add_argument("--model", help="judge model identifier recorded in each request")
+    calibrate.add_argument("--threshold", type=float, default=0.7, help="score threshold for pass/fail classification")
+    calibrate.add_argument("--min-accuracy", type=float, help="fail unless gold-set accuracy meets this threshold")
+    calibrate.add_argument("--format", choices=("text", "json"), default="text")
+    calibrate.add_argument("--output", type=Path)
+
+    verify = commands.add_parser("verify-bundle", help="check hashes and integrity of a run artifact bundle")
+    verify.add_argument("bundle", type=Path)
+    verify.add_argument("--format", choices=("text", "json"), default="text")
+    verify.add_argument("--output", type=Path)
 
     mutate = commands.add_parser("mutate", help="check whether scenarios catch representative trace regressions")
     mutate.add_argument("scenarios", type=Path, help="scenario YAML file or directory")
@@ -196,6 +214,26 @@ def _selected_results(path: Path, all_scenarios: list, selected_scenarios: list)
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
+        if args.command == "verify-bundle":
+            verification = verify_bundle(args.bundle)
+            rendered = json.dumps(verification, indent=2, ensure_ascii=False) if args.format == "json" else (
+                f"Bundle {verification['run_id']}: "
+                f"{'VALID' if verification['valid'] else 'INVALID'} "
+                f"({verification['verified_files']} files checked)"
+                + ("\n" + "\n".join(verification["errors"]) if verification["errors"] else "")
+            )
+            _write_output(args.output, rendered)
+            return 0 if verification["valid"] else 1
+
+        if args.command == "calibrate-judge":
+            report = calibrate_judge(
+                args.gold_set, args.judge, load_judge_registry(), model=args.model,
+                threshold=args.threshold, min_accuracy=args.min_accuracy,
+            )
+            rendered = json.dumps(report, indent=2, ensure_ascii=False) if args.format == "json" else text_calibration_report(report)
+            _write_output(args.output, rendered)
+            return 0 if report["passed_gate"] else 1
+
         if args.command == "adapt":
             adapter = PathMappingAdapter.from_yaml(args.mapping)
             output = _adapt_jsonl(args.traces, adapter)
@@ -348,6 +386,16 @@ def main(argv: list[str] | None = None) -> int:
                 report, {result.scenario: result for result in results}, len(scenarios),
                 max_cost_usd=args.max_cost_usd, max_input_tokens=args.max_input_tokens,
                 max_output_tokens=args.max_output_tokens, max_p95_latency_ms=args.max_p95_latency_ms)
+            if args.bundle_dir:
+                create_bundle(args.bundle_dir, args.scenarios, scenarios,
+                              {result.scenario: result for result in results}, report,
+                              {"command": "run-agent", "runner": args.runner, "format": args.format,
+                               "strict": True, "selected_scenarios": [item.name for item in scenarios],
+                               "judge_repetitions": args.judge_repetitions,
+                               "budgets": {"max_cost_usd": args.max_cost_usd,
+                                           "max_input_tokens": args.max_input_tokens,
+                                           "max_output_tokens": args.max_output_tokens,
+                                           "max_p95_latency_ms": args.max_p95_latency_ms}})
             if args.format == "json":
                 rendered = json_report(report)
             elif args.format == "html":
@@ -364,6 +412,16 @@ def main(argv: list[str] | None = None) -> int:
             report, results, len(scenarios), max_cost_usd=args.max_cost_usd,
             max_input_tokens=args.max_input_tokens, max_output_tokens=args.max_output_tokens,
             max_p95_latency_ms=args.max_p95_latency_ms)
+        if args.bundle_dir:
+            create_bundle(args.bundle_dir, args.scenarios, scenarios, results, report,
+                          {"command": "run", "format": args.format, "strict": args.strict,
+                           "selected_scenarios": [item.name for item in scenarios],
+                           "judge_repetitions": args.judge_repetitions,
+                           "judge_cache_enabled": args.judge_cache is not None,
+                           "budgets": {"max_cost_usd": args.max_cost_usd,
+                                       "max_input_tokens": args.max_input_tokens,
+                                       "max_output_tokens": args.max_output_tokens,
+                                       "max_p95_latency_ms": args.max_p95_latency_ms}})
     except (AdapterError, GraderError, RunnerError, ScenarioError, ResultError, OSError, ValueError) as exc:
         print(f"agent-eval: error: {exc}", file=sys.stderr)
         return 2

@@ -26,6 +26,8 @@ The core package has no model-provider or agent-framework dependency. Optional r
 - **Scenario version audits** — snapshot scenario contracts, detect breaking edits, and migrate scenario-set and per-scenario versions.
 - **Failure triage and slices** — group regressions by cause and compare pass rates by intent, tag, model, and prompt version.
 - **Execution budgets** — gate total cost/tokens and p95 scenario latency in local runs or CI.
+- **Gold-set judge calibration** — measure semantic judge accuracy against human-labeled cases, including precision, recall, F1, and score calibration.
+- **Reproducible run bundles** — package evaluated scenarios, results, reports, settings, and integrity hashes for later review or replay.
 
 Built-in checks are deterministic and work over structured traces. Semantic judges are opt-in plugins; the core does not make provider calls or require model credentials.
 
@@ -325,6 +327,16 @@ agent-eval triage scenarios/ --responses run.jsonl --format json
 
 The report groups failures by cause and summarizes pass rates by expected intent, scenario tag, and available model/prompt metadata. `triage` is informational and returns `0` after producing the report.
 
+Create a portable run bundle with any recorded or plugin-backed evaluation:
+
+```bash
+agent-eval run scenarios/ --responses run.jsonl --strict \
+  --bundle-dir artifacts/evaluation-2026-10-13
+agent-eval verify-bundle artifacts/evaluation-2026-10-13
+```
+
+Bundles contain the selected scenario YAML files, scenario version snapshot, normalized `results.jsonl`, JSON report, run settings, and a SHA-256 inventory. Verification checks every listed file and the bundle run ID. Re-run an evaluation with `agent-eval run artifacts/evaluation-2026-10-13/scenarios --responses artifacts/evaluation-2026-10-13/results.jsonl --strict`. Bundle directories must be new; existing destinations are never overwritten. Bundles copy scenario inputs and captured results, so protect them like the source data.
+
 Semantic judges can be repeated and cached during evaluation. Cache files should be treated as evaluation artifacts because they contain judge scores, rationales, and request fingerprints:
 
 ```bash
@@ -333,6 +345,15 @@ agent-eval judge-agreement report-a.json report-b.json
 ```
 
 Repeated judge scores and their population standard deviation are recorded in grade metadata. `judge-agreement` compares pass/fail decisions and score ranges by scenario across JSON reports. It needs at least two reports containing semantic judge results.
+
+Calibrate a semantic judge against a held-out YAML gold set with human-labeled expected decisions:
+
+```bash
+agent-eval calibrate-judge examples/judge-gold-set.yaml \
+  --judge my-judge --model judge-model-v2 --threshold 0.7 --min-accuracy 0.9
+```
+
+Gold sets declare `cases` with a unique `id`, `input`, `answer`, and `expected_passed`; optional `expected_score` labels the target score. A top-level or case-level rubric is supported. Reports include confusion counts, accuracy, precision, recall, F1, Brier score, mean absolute score error, judge version, and individual disagreements. `--min-accuracy` makes calibration a CI gate. Keep the gold set separate from examples used to tune the judge or rubric. See [`examples/judge-gold-set.yaml`](examples/judge-gold-set.yaml).
 
 Generate deterministic coverage-guided candidates for human review:
 
