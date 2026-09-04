@@ -28,6 +28,9 @@ The core package has no model-provider or agent-framework dependency. Optional r
 - **Execution budgets** — gate total cost/tokens and p95 scenario latency in local runs or CI.
 - **Gold-set judge calibration** — measure semantic judge accuracy against human-labeled cases, including precision, recall, F1, and score calibration.
 - **Reproducible run bundles** — package evaluated scenarios, results, reports, settings, and integrity hashes for later review or replay.
+- **Pull request annotations** — surface scenario regressions as GitHub Actions annotations and add a metric comparison to the job summary.
+- **Behavior drift monitoring** — compare sampled current traces with a baseline and fail when metric movement or scenario regressions exceed configured limits.
+- **Model and prompt experiments** — score named result sets side by side, including quality, cost, token usage, and latency metadata.
 
 Built-in checks are deterministic and work over structured traces. Semantic judges are opt-in plugins; the core does not make provider calls or require model credentials.
 
@@ -373,6 +376,39 @@ agent-eval compare scenarios/ \
 ```
 
 The comparison exits `1` when the candidate regresses a scenario, `0` otherwise, and `2` for invalid input. Add `--format json` for machine-readable output. Metric deltas are candidate minus baseline; a negative unnecessary-question delta is an improvement.
+
+Emit inline GitHub Actions annotations for regressed scenarios and append a Markdown comparison to the job summary:
+
+```bash
+agent-eval compare scenarios/ \
+  --baseline artifacts/baseline.jsonl \
+  --candidate artifacts/candidate.jsonl \
+  --strict --github-annotations
+```
+
+The command uses `GITHUB_STEP_SUMMARY` when available; pass `--summary-file path.md` to select a summary file explicitly. Each regressed scenario becomes an `::error` annotation, and the command keeps the normal regression exit status so it can gate a pull request.
+
+Monitor a sampled production trace batch against a known-good canonical JSONL baseline:
+
+```bash
+agent-eval monitor scenarios/ \
+  --baseline artifacts/release-baseline.jsonl \
+  --current artifacts/production-sample.jsonl \
+  --max-absolute-drift 0.05 --format json --output drift-report.json
+```
+
+The default threshold is five percentage points of absolute movement per available metric. Any scenario regression or metric beyond the threshold fails the command. Convert exported traces with `adapt-otel` or another adapter first; the OpenTelemetry adapter excludes sensitive attributes by default. Keep sampled inputs and result artifacts redacted and apply your normal retention controls.
+
+Compare two or more model or prompt result sets with named variants:
+
+```bash
+agent-eval experiment scenarios/ \
+  --variant model-a-prompt-v1=artifacts/model-a.jsonl \
+  --variant model-b-prompt-v2=artifacts/model-b.jsonl \
+  --format json --output experiment.json
+```
+
+Each variant reports its recorded model and prompt versions, scenario pass rate, behavior metrics, failing scenario IDs, and available aggregate cost/token plus mean and p95 latency metadata. The harness scores captured results; your runner or experiment pipeline is responsible for executing each model/prompt combination and recording its metadata.
 
 Analyze variability across repeated executions by passing two or more captured result files:
 

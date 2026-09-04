@@ -34,6 +34,11 @@ jobs:
           agent-eval scenario-version scenarios/ --format json --output agent-eval-scenario-version.json
           agent-eval triage scenarios/ --responses examples/responses.jsonl --format json --output agent-eval-triage.json
           agent-eval run scenarios/clinic_hours.yaml --responses examples/budget-responses.jsonl --strict --max-cost-usd 0.01 --max-input-tokens 100 --max-output-tokens 50 --max-p95-latency-ms 200 --format json --output agent-eval-budget.json
+      - name: Check PR annotations, drift gates, and experiment matrix
+        run: |
+          agent-eval compare scenarios/ --baseline examples/responses-before.jsonl --candidate examples/responses.jsonl --strict --github-annotations
+          agent-eval monitor scenarios/ --baseline examples/responses.jsonl --current examples/responses.jsonl --max-absolute-drift 0 --format json --output agent-eval-drift.json
+          agent-eval experiment scenarios/ --variant baseline=examples/responses-before.jsonl --variant candidate=examples/responses.jsonl --format json --output agent-eval-experiment.json
       - name: Upload evaluation report
         if: always()
         uses: actions/upload-artifact@v4
@@ -47,5 +52,7 @@ jobs:
             agent-eval-scenario-version.json
             agent-eval-triage.json
             agent-eval-budget.json
+            agent-eval-drift.json
+            agent-eval-experiment.json
             agent-eval-bundle/
           if-no-files-found: ignore

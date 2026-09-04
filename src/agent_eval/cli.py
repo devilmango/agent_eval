@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -16,6 +17,7 @@ from agent_eval.budgets import apply_budgets
 from agent_eval.comparison import compare_reports, text_comparison
 from agent_eval.graders import GraderError, load_judge_registry
 from agent_eval.models import AgentResult
+from agent_eval.monitoring import drift_report, experiment_matrix, github_annotation_report, read_variant_spec
 from agent_eval.otel import OpenTelemetryAdapter, load_otel_document
 from agent_eval.quality import failure_analysis, mutation_report, scenario_coverage, scenario_suggestions, judge_agreement, text_coverage, text_mutation_report, text_failure_analysis
 from agent_eval.report import html_report, json_report, repeated_html_report, text_report
@@ -79,7 +81,25 @@ def build_parser() -> argparse.ArgumentParser:
     compare.add_argument("--candidate", required=True, type=Path, help="candidate JSONL results")
     compare.add_argument("--format", choices=("text", "json"), default="text")
     compare.add_argument("--strict", action="store_true", help="fail when either run is missing results")
+    compare.add_argument("--github-annotations", action="store_true", help="emit GitHub Actions error annotations for regressed scenarios")
+    compare.add_argument("--summary-file", type=Path, help="append a Markdown summary (defaults to GITHUB_STEP_SUMMARY when set)")
     _add_tag_filters(compare)
+
+    monitor = commands.add_parser("monitor", help="compare sampled current behavior with a recorded baseline")
+    monitor.add_argument("scenarios", type=Path, help="scenario YAML file or directory")
+    monitor.add_argument("--baseline", required=True, type=Path, help="baseline canonical result JSONL")
+    monitor.add_argument("--current", required=True, type=Path, help="current sampled canonical result JSONL")
+    monitor.add_argument("--max-absolute-drift", type=float, default=0.05, help="maximum absolute change allowed for each metric (0–1; default: 0.05)")
+    monitor.add_argument("--format", choices=("text", "json"), default="text")
+    monitor.add_argument("--output", type=Path)
+    _add_tag_filters(monitor)
+
+    matrix = commands.add_parser("experiment", help="compare named model or prompt result sets")
+    matrix.add_argument("scenarios", type=Path, help="scenario YAML file or directory")
+    matrix.add_argument("--variant", action="append", required=True, metavar="NAME=RESULTS.jsonl", help="named result set; repeat at least twice")
+    matrix.add_argument("--format", choices=("text", "json"), default="text")
+    matrix.add_argument("--output", type=Path)
+    _add_tag_filters(matrix)
 
     repeat = commands.add_parser("repeat", help="analyze variability across repeated result files")
     repeat.add_argument("scenarios", type=Path, help="scenario YAML file or directory")
@@ -323,11 +343,68 @@ def main(argv: list[str] | None = None) -> int:
                 scenarios, _selected_results(args.candidate, all_scenarios, scenarios), strict=args.strict
             )
             comparison = compare_reports(baseline, candidate)
+            if args.github_annotations:
+                annotations, summary = github_annotation_report(comparison, candidate)
+                if annotations:
+                    print(annotations)
+                summary_path = args.summary_file or (Path(os.environ["GITHUB_STEP_SUMMARY"]) if os.environ.get("GITHUB_STEP_SUMMARY") else None)
+                if summary_path:
+                    with summary_path.open("a", encoding="utf-8") as handle:
+                        handle.write(summary)
+                elif not annotations:
+                    print(summary)
+                return 0 if not comparison["regressed_scenarios"] else 1
             if args.format == "json":
                 print(json.dumps(comparison, indent=2, ensure_ascii=False))
             else:
                 print(text_comparison(comparison))
             return 0 if not comparison["regressed_scenarios"] else 1
+
+        if args.command == "monitor":
+            if not 0 <= args.max_absolute_drift <= 1:
+                raise ValueError("--max-absolute-drift must be between 0 and 1")
+            baseline = evaluate(scenarios, _selected_results(args.baseline, all_scenarios, scenarios))
+            current = evaluate(scenarios, _selected_results(args.current, all_scenarios, scenarios))
+            drift = drift_report(baseline, current, max_absolute_drift=args.max_absolute_drift)
+            if args.format == "json":
+                rendered = json.dumps(drift, indent=2, ensure_ascii=False)
+            else:
+                lines = ["Behavior drift monitor", "", f"Status: {'PASS' if drift['passed'] else 'FAIL'}",
+                         f"Maximum absolute metric drift: {args.max_absolute_drift:.1%}", "", "Metric changes:"]
+                for metric, item in drift["metrics"].items():
+                    delta = "n/a" if item["delta"] is None else f"{item['delta'] * 100:+.1f} pp"
+                    lines.append(f"  {'PASS' if item['passed'] else 'FAIL'} {metric}: {delta}")
+                lines.extend(["", "Regressed scenarios: " + (", ".join(drift["regressed_scenarios"]) or "none")])
+                rendered = "\n".join(lines)
+            _write_output(args.output, rendered)
+            return 0 if drift["passed"] else 1
+
+        if args.command == "experiment":
+            specs = [read_variant_spec(value) for value in args.variant]
+            names = [name.casefold() for name, _ in specs]
+            if len(specs) < 2:
+                raise ValueError("experiment requires at least two --variant values")
+            if len(names) != len(set(names)):
+                raise ValueError("experiment variant names must be unique")
+            report = experiment_matrix(
+                scenarios,
+                [(name, _selected_results(path, all_scenarios, scenarios)) for name, path in specs],
+            )
+            if args.format == "json":
+                rendered = json.dumps(report, indent=2, ensure_ascii=False)
+            else:
+                lines = [f"Experiment matrix: {report['variant_count']} variants across {report['scenario_count']} scenarios", ""]
+                for variant in report["variants"]:
+                    lines.extend([f"{variant['name']}: {variant['passed']}/{variant['total']} passed ({variant['pass_rate']:.1%})",
+                                  f"  models={', '.join(variant['models']) or 'n/a'}, prompt_versions={', '.join(variant['prompt_versions']) or 'n/a'}",
+                                  f"  intent={_percent(variant['metrics']['intent_accuracy'])}, tool={_percent(variant['metrics']['tool_accuracy'])}, policy={_percent(variant['metrics']['policy_compliance'])}, unnecessary_questions={_percent(variant['metrics']['unnecessary_question_rate'])}",
+                                  f"  cost=${variant['execution']['cost_usd'] if variant['execution']['cost_usd'] is not None else 'n/a'}, input_tokens={variant['execution']['input_tokens'] if variant['execution']['input_tokens'] is not None else 'n/a'}, output_tokens={variant['execution']['output_tokens'] if variant['execution']['output_tokens'] is not None else 'n/a'}, p95_latency_ms={variant['execution']['p95_latency_ms'] if variant['execution']['p95_latency_ms'] is not None else 'n/a'}"])
+                    if variant["failed_scenarios"]:
+                        lines.append("  failing scenarios: " + ", ".join(variant["failed_scenarios"]))
+                    lines.append("")
+                rendered = "\n".join(lines).rstrip()
+            _write_output(args.output, rendered)
+            return 0
 
         if args.command == "triage":
             results = _selected_results(args.responses, all_scenarios, scenarios)
@@ -441,6 +518,10 @@ def _write_output(path: Path | None, content: str) -> None:
         print(content)
     else:
         path.write_text(content + ("\n" if not content.endswith("\n") else ""), encoding="utf-8")
+
+
+def _percent(value: float | None) -> str:
+    return "n/a" if value is None else f"{value:.1%}"
 
 
 if __name__ == "__main__":
