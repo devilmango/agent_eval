@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from math import ceil, isfinite
+from pathlib import Path
 from typing import Any
 
 from agent_eval.comparison import compare_reports

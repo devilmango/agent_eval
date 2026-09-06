@@ -150,6 +150,11 @@ def _resolve_path(record: Any, path: str) -> Any:
     return values if len(values) > 1 or "[*]" in path else values[0]
 
 
+def resolve_trace_path(record: Any, path: str) -> Any:
+    """Resolve a JSON trace path using the same syntax as path-mapping adapters."""
+    return _resolve_path(record, path)
+
+
 def _as_strings(value: Any, field: str) -> tuple[str, ...]:
     if value is None:
         return ()

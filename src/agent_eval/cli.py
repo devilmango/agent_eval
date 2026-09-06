@@ -15,7 +15,9 @@ from agent_eval.calibration import CalibrationError, calibrate_judge, text_calib
 from agent_eval.adapters import AdapterError, PathMappingAdapter, load_adapter_plugin, result_as_dict
 from agent_eval.budgets import apply_budgets
 from agent_eval.comparison import compare_reports, text_comparison
+from agent_eval.drafts import DraftError, create_scenario_drafts
 from agent_eval.graders import GraderError, load_judge_registry
+from agent_eval.history import HistoryError, load_history, record_history, text_trend_report, trend_report
 from agent_eval.models import AgentResult
 from agent_eval.monitoring import drift_report, experiment_matrix, github_annotation_report, read_variant_spec
 from agent_eval.otel import OpenTelemetryAdapter, load_otel_document
@@ -100,6 +102,31 @@ def build_parser() -> argparse.ArgumentParser:
     matrix.add_argument("--format", choices=("text", "json"), default="text")
     matrix.add_argument("--output", type=Path)
     _add_tag_filters(matrix)
+
+    history = commands.add_parser("history", help="store evaluation summaries and inspect quality trends")
+    history_commands = history.add_subparsers(dest="history_command", required=True)
+    history_record = history_commands.add_parser("record", help="append an evaluation or verified bundle summary")
+    history_record.add_argument("--store", required=True, type=Path, help="append-only JSONL history path")
+    history_sources = history_record.add_mutually_exclusive_group(required=True)
+    history_sources.add_argument("--responses", type=Path, help="canonical result JSONL to evaluate")
+    history_sources.add_argument("--bundle", type=Path, help="verified run bundle to summarize")
+    history_record.add_argument("--scenarios", type=Path, help="scenario directory or file (required with --responses)")
+    history_record.add_argument("--label", help="human-readable release, model, or prompt label")
+    history_record.add_argument("--strict", action="store_true", help="require a result for every scenario")
+    history_record.add_argument("--format", choices=("text", "json"), default="text")
+    history_trend = history_commands.add_parser("trend", help="summarize metric trends from a history file")
+    history_trend.add_argument("store", type=Path, help="evaluation history JSONL")
+    history_trend.add_argument("--limit", type=int, help="show only the latest N records")
+    history_trend.add_argument("--format", choices=("text", "json"), default="text")
+    history_trend.add_argument("--output", type=Path)
+
+    drafts = commands.add_parser("draft-scenarios", help="create human-review YAML drafts from trace JSONL")
+    drafts.add_argument("traces", type=Path, help="raw trace records as JSON Lines")
+    drafts.add_argument("--mapping", required=True, type=Path, help="trace-to-result YAML field mapping")
+    drafts.add_argument("--input-path", required=True, help="dot path to the captured user input in each trace")
+    drafts.add_argument("--output-dir", required=True, type=Path, help="new directory for review-only YAML drafts")
+    drafts.add_argument("--format", choices=("text", "json"), default="text")
+    drafts.add_argument("--report", type=Path, help="write the draft creation summary to a file")
 
     repeat = commands.add_parser("repeat", help="analyze variability across repeated result files")
     repeat.add_argument("scenarios", type=Path, help="scenario YAML file or directory")
@@ -285,6 +312,46 @@ def main(argv: list[str] | None = None) -> int:
                 seen.add(result.scenario)
                 lines.append(json.dumps(result_as_dict(result), ensure_ascii=False))
             _write_output(args.output, "\n".join(lines))
+            return 0
+
+        if args.command == "draft-scenarios":
+            report = create_scenario_drafts(args.traces, args.mapping, args.input_path, args.output_dir)
+            rendered = json.dumps(report, indent=2, ensure_ascii=False) if args.format == "json" else (
+                f"Created {report['draft_count']} review-only scenario draft(s) in {report['output_dir']}\n"
+                "Expected behavior fields are blank and require human review."
+            )
+            _write_output(args.report, rendered)
+            return 0
+
+        if args.command == "history":
+            if args.history_command == "trend":
+                report = trend_report(load_history(args.store), limit=args.limit)
+                rendered = json.dumps(report, indent=2, ensure_ascii=False) if args.format == "json" else text_trend_report(report)
+                _write_output(args.output, rendered)
+                return 0
+            if args.bundle:
+                verification = verify_bundle(args.bundle)
+                if not verification["valid"]:
+                    raise BundleError("cannot record invalid bundle: " + "; ".join(verification["errors"]))
+                try:
+                    report_data = json.loads((args.bundle / "report.json").read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError) as exc:
+                    raise BundleError(f"could not read bundle report: {exc}") from exc
+                recorded = record_history(args.store, report_data, label=args.label,
+                                          source_type="bundle", run_id=verification["run_id"])
+            else:
+                if args.scenarios is None:
+                    raise HistoryError("--scenarios is required when recording --responses")
+                history_scenarios = load_scenarios(args.scenarios)
+                history_results = _selected_results(args.responses, history_scenarios, history_scenarios)
+                history_report = evaluate(history_scenarios, history_results, strict=args.strict)
+                recorded = record_history(args.store, history_report.as_dict(), label=args.label,
+                                          source_type="results")
+            rendered = json.dumps(recorded, indent=2, ensure_ascii=False) if args.format == "json" else (
+                f"Recorded evaluation {recorded['run_id']} ({recorded['passed']}/{recorded['total']} passed) "
+                f"in {args.store}"
+            )
+            print(rendered)
             return 0
 
         all_scenarios = load_scenarios(args.scenarios)
@@ -499,7 +566,7 @@ def main(argv: list[str] | None = None) -> int:
                                        "max_input_tokens": args.max_input_tokens,
                                        "max_output_tokens": args.max_output_tokens,
                                        "max_p95_latency_ms": args.max_p95_latency_ms}})
-    except (AdapterError, GraderError, RunnerError, ScenarioError, ResultError, OSError, ValueError) as exc:
+    except (AdapterError, DraftError, HistoryError, GraderError, RunnerError, ScenarioError, ResultError, OSError, ValueError) as exc:
         print(f"agent-eval: error: {exc}", file=sys.stderr)
         return 2
 

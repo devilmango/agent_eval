@@ -39,6 +39,11 @@ jobs:
           agent-eval compare scenarios/ --baseline examples/responses-before.jsonl --candidate examples/responses.jsonl --strict --github-annotations
           agent-eval monitor scenarios/ --baseline examples/responses.jsonl --current examples/responses.jsonl --max-absolute-drift 0 --format json --output agent-eval-drift.json
           agent-eval experiment scenarios/ --variant baseline=examples/responses-before.jsonl --variant candidate=examples/responses.jsonl --format json --output agent-eval-experiment.json
+      - name: Record evaluation history and create review-only scenario drafts
+        run: |
+          agent-eval history record --bundle agent-eval-bundle --store agent-eval-history.jsonl --label ci-run
+          agent-eval history trend agent-eval-history.jsonl --format json --output agent-eval-history-trend.json
+          agent-eval draft-scenarios examples/draft-traces.jsonl --mapping examples/draft-mapping.yaml --input-path request.user --output-dir agent-eval-scenario-drafts
       - name: Upload evaluation report
         if: always()
         uses: actions/upload-artifact@v4
@@ -54,5 +59,8 @@ jobs:
             agent-eval-budget.json
             agent-eval-drift.json
             agent-eval-experiment.json
+            agent-eval-history.jsonl
+            agent-eval-history-trend.json
             agent-eval-bundle/
+            agent-eval-scenario-drafts/
           if-no-files-found: ignore

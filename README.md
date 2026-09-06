@@ -31,6 +31,8 @@ The core package has no model-provider or agent-framework dependency. Optional r
 - **Pull request annotations** — surface scenario regressions as GitHub Actions annotations and add a metric comparison to the job summary.
 - **Behavior drift monitoring** — compare sampled current traces with a baseline and fail when metric movement or scenario regressions exceed configured limits.
 - **Model and prompt experiments** — score named result sets side by side, including quality, cost, token usage, and latency metadata.
+- **Evaluation history** — append compact run or bundle summaries to JSONL and inspect pass-rate and metric trends over time.
+- **Trace-to-scenario drafts** — convert observed traces into review-only YAML drafts while leaving expected behavior blank for human authors.
 
 Built-in checks are deterministic and work over structured traces. Semantic judges are opt-in plugins; the core does not make provider calls or require model credentials.
 
@@ -358,6 +360,18 @@ agent-eval calibrate-judge examples/judge-gold-set.yaml \
 
 Gold sets declare `cases` with a unique `id`, `input`, `answer`, and `expected_passed`; optional `expected_score` labels the target score. A top-level or case-level rubric is supported. Reports include confusion counts, accuracy, precision, recall, F1, Brier score, mean absolute score error, judge version, and individual disagreements. `--min-accuracy` makes calibration a CI gate. Keep the gold set separate from examples used to tune the judge or rubric. See [`examples/judge-gold-set.yaml`](examples/judge-gold-set.yaml).
 
+Store compact evaluation summaries over time and inspect changes from the first retained run to the latest:
+
+```bash
+agent-eval history record --scenarios scenarios/ --responses run.jsonl \
+  --store .agent-eval/history.jsonl --label release-2026-10
+agent-eval history record --bundle artifacts/agent-eval-bundle \
+  --store .agent-eval/history.jsonl --label release-2026-10
+agent-eval history trend .agent-eval/history.jsonl --limit 30
+```
+
+`history record` accepts canonical results or a bundle. Bundles are integrity-verified before recording. The append-only JSONL store keeps aggregate metrics, counts, selected execution metadata, and labels; it does not copy scenario inputs or traces. Keep the store with your CI artifacts or durable storage if you need long-term trends.
+
 Generate deterministic coverage-guided candidates for human review:
 
 ```bash
@@ -365,6 +379,17 @@ agent-eval suggest scenarios/ --limit 25 --output suggestions.json
 ```
 
 Suggestions include a small input paraphrase and missing behavior dimensions. They are deliberately not executable scenarios: a reviewer must author and verify expected behavior before adopting a candidate.
+
+Generate scenario drafts from exported JSONL traces using the same field mapping as `adapt`. Supply a path to the captured user input:
+
+```bash
+agent-eval draft-scenarios traces.jsonl \
+  --mapping examples/draft-mapping.yaml \
+  --input-path request.user \
+  --output-dir scenario-drafts/
+```
+
+Each YAML file separates `observed` intent, questions, tools, and actions from the `expected` section. Expected values are `null` and the document is marked `draft: true`, so the trace is never silently promoted to an oracle. Replace those placeholders with human-approved behavior before moving a draft into the executable scenario set. Output directories must be new. Trace inputs can contain personal or confidential data; sanitize exports before creating drafts.
 
 Compare a candidate run with a baseline to see scenario regressions and metric changes:
 

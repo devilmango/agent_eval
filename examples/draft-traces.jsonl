@@ -1,0 +1,1 @@
+{"metadata":{"scenario_id":"appointment_reschedule"},"request":{"user":"Can I move my appointment to tomorrow?"},"agent":{"final":{"intent":"RESCHEDULE","questions":["patient_identity","preferred_time"]}},"trace":{"tool_calls":[{"name":"lookup_appointment","arguments":{"patient_id":"demo-patient"}}],"actions":[]}}
