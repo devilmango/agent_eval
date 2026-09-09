@@ -32,7 +32,9 @@ The core package has no model-provider or agent-framework dependency. Optional r
 - **Behavior drift monitoring** — compare sampled current traces with a baseline and fail when metric movement or scenario regressions exceed configured limits.
 - **Model and prompt experiments** — score named result sets side by side, including quality, cost, token usage, and latency metadata.
 - **Evaluation history** — append compact run or bundle summaries to JSONL and inspect pass-rate and metric trends over time.
-- **Trace-to-scenario drafts** — convert observed traces into review-only YAML drafts while leaving expected behavior blank for human authors.
+- **Trace-to-scenario drafts** — convert observed traces into review-only YAML drafts, track approvals, detect duplicate inputs, and promote reviewed scenarios.
+- **Confidence-aware comparisons** — estimate paired bootstrap intervals for pass rate and scenario-level quality metrics in candidate and experiment comparisons.
+- **Risk-based release gates** — apply separate pass-rate thresholds to the full suite, critical tags, and named scenarios across repeated runs.
 
 Built-in checks are deterministic and work over structured traces. Semantic judges are opt-in plugins; the core does not make provider calls or require model credentials.
 
@@ -389,7 +391,24 @@ agent-eval draft-scenarios traces.jsonl \
   --output-dir scenario-drafts/
 ```
 
-Each YAML file separates `observed` intent, questions, tools, and actions from the `expected` section. Expected values are `null` and the document is marked `draft: true`, so the trace is never silently promoted to an oracle. Replace those placeholders with human-approved behavior before moving a draft into the executable scenario set. Output directories must be new. Trace inputs can contain personal or confidential data; sanitize exports before creating drafts.
+Each YAML file separates `observed` intent, questions, tools, and actions from the `expected` section. Expected values are `null` and the document is marked `draft: true`, so the trace is never silently promoted to an oracle. Output directories must be new. Trace inputs can contain personal or confidential data; sanitize exports before creating drafts.
+
+Review the generated set, including exact-input duplicates:
+
+```bash
+agent-eval drafts list scenario-drafts/
+```
+
+Edit a draft's `expected.intent`, `expected.must_ask`, `expected.tools`, and `must_not` with human-approved values. Use empty lists when a behavior dimension was reviewed and none are expected. Record an approval, then promote it into the scenario directory:
+
+```bash
+agent-eval drafts review scenario-drafts/001-appointment_reschedule.yaml \
+  --status approved --reviewer "Ada Reviewer" --notes "Checked against support policy"
+agent-eval drafts promote scenario-drafts/001-appointment_reschedule.yaml \
+  --output-dir scenarios/
+```
+
+Approval requires all expected-behavior placeholders to be filled, and promotion validates the resulting scenario. Exact-input duplicates are reported and promotion requires `--allow-duplicate` after review.
 
 Compare a candidate run with a baseline to see scenario regressions and metric changes:
 
@@ -401,6 +420,8 @@ agent-eval compare scenarios/ \
 ```
 
 The comparison exits `1` when the candidate regresses a scenario, `0` otherwise, and `2` for invalid input. Add `--format json` for machine-readable output. Metric deltas are candidate minus baseline; a negative unnecessary-question delta is an improvement.
+
+Comparisons and experiment matrices include paired bootstrap intervals for pass rate, intent accuracy, checked tool accuracy, and answer quality. Pairing keeps each scenario's baseline and candidate outcome together during resampling. Set `--confidence`, `--bootstrap-samples` (at least 100), and `--seed` to control the interval and make it reproducible. At least two matched scenarios are needed to estimate an interval; the report still provides the paired point estimate when fewer are available. The first `--variant` in an experiment matrix is its comparison baseline.
 
 Emit inline GitHub Actions annotations for regressed scenarios and append a Markdown comparison to the job summary:
 
@@ -434,6 +455,27 @@ agent-eval experiment scenarios/ \
 ```
 
 Each variant reports its recorded model and prompt versions, scenario pass rate, behavior metrics, failing scenario IDs, and available aggregate cost/token plus mean and p95 latency metadata. The harness scores captured results; your runner or experiment pipeline is responsible for executing each model/prompt combination and recording its metadata.
+
+Define risk-weighted release requirements in a YAML profile:
+
+```yaml
+min_overall_pass_rate: 0.98
+critical_tags:
+  safety: 1.0
+  regulated: 0.99
+critical_scenarios:
+  appointment_reschedule: 1.0
+```
+
+Apply the profile to one or more captured runs:
+
+```bash
+agent-eval gate scenarios/ \
+  --runs runs/run-01.jsonl runs/run-02.jsonl runs/run-03.jsonl \
+  --profile release-gates.yaml --format json --output release-gate-report.json
+```
+
+Rates are calculated over all scenario outcomes across the supplied runs. A tag gate covers every scenario carrying that tag; a critical scenario gate checks that scenario by itself. Missing result rows count as failed outcomes. An unknown tag or scenario ID makes the profile invalid instead of silently skipping its gate.
 
 Analyze variability across repeated executions by passing two or more captured result files:
 

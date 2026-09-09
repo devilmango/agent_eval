@@ -14,8 +14,12 @@ from agent_eval.bundles import BundleError, create_bundle, verify_bundle
 from agent_eval.calibration import CalibrationError, calibrate_judge, text_calibration_report
 from agent_eval.adapters import AdapterError, PathMappingAdapter, load_adapter_plugin, result_as_dict
 from agent_eval.budgets import apply_budgets
-from agent_eval.comparison import compare_reports, text_comparison
-from agent_eval.drafts import DraftError, create_scenario_drafts
+from agent_eval.comparison import compare_reports, paired_bootstrap_intervals, text_comparison
+from agent_eval.drafts import (
+    DraftError, create_scenario_drafts, list_scenario_drafts,
+    promote_scenario_draft, review_scenario_draft,
+)
+from agent_eval.gate_profiles import GateProfileError, evaluate_release_gates, load_gate_profile, text_release_gate_report
 from agent_eval.graders import GraderError, load_judge_registry
 from agent_eval.history import HistoryError, load_history, record_history, text_trend_report, trend_report
 from agent_eval.models import AgentResult
@@ -83,6 +87,9 @@ def build_parser() -> argparse.ArgumentParser:
     compare.add_argument("--candidate", required=True, type=Path, help="candidate JSONL results")
     compare.add_argument("--format", choices=("text", "json"), default="text")
     compare.add_argument("--strict", action="store_true", help="fail when either run is missing results")
+    compare.add_argument("--confidence", type=float, default=0.95, help="paired bootstrap confidence level (default: 0.95)")
+    compare.add_argument("--bootstrap-samples", type=int, default=2000, help="paired bootstrap resamples (minimum: 100)")
+    compare.add_argument("--seed", type=int, default=0, help="bootstrap random seed for reproducible intervals")
     compare.add_argument("--github-annotations", action="store_true", help="emit GitHub Actions error annotations for regressed scenarios")
     compare.add_argument("--summary-file", type=Path, help="append a Markdown summary (defaults to GITHUB_STEP_SUMMARY when set)")
     _add_tag_filters(compare)
@@ -101,6 +108,9 @@ def build_parser() -> argparse.ArgumentParser:
     matrix.add_argument("--variant", action="append", required=True, metavar="NAME=RESULTS.jsonl", help="named result set; repeat at least twice")
     matrix.add_argument("--format", choices=("text", "json"), default="text")
     matrix.add_argument("--output", type=Path)
+    matrix.add_argument("--confidence", type=float, default=0.95, help="paired bootstrap confidence level (default: 0.95)")
+    matrix.add_argument("--bootstrap-samples", type=int, default=2000, help="paired bootstrap resamples (minimum: 100)")
+    matrix.add_argument("--seed", type=int, default=0, help="bootstrap random seed for reproducible intervals")
     _add_tag_filters(matrix)
 
     history = commands.add_parser("history", help="store evaluation summaries and inspect quality trends")
@@ -127,6 +137,29 @@ def build_parser() -> argparse.ArgumentParser:
     drafts.add_argument("--output-dir", required=True, type=Path, help="new directory for review-only YAML drafts")
     drafts.add_argument("--format", choices=("text", "json"), default="text")
     drafts.add_argument("--report", type=Path, help="write the draft creation summary to a file")
+
+    draft_admin = commands.add_parser("drafts", help="list, review, and promote trace-derived scenario drafts")
+    draft_commands = draft_admin.add_subparsers(dest="draft_command", required=True)
+    draft_list = draft_commands.add_parser("list", help="show review status and exact-input duplicates")
+    draft_list.add_argument("directory", type=Path)
+    draft_list.add_argument("--format", choices=("text", "json"), default="text")
+    draft_list.add_argument("--output", type=Path)
+    draft_review = draft_commands.add_parser("review", help="approve or reject a draft after editing expected behavior")
+    draft_review.add_argument("draft", type=Path)
+    draft_review.add_argument("--status", required=True, choices=("approved", "rejected"))
+    draft_review.add_argument("--reviewer", required=True)
+    draft_review.add_argument("--notes")
+    draft_promote = draft_commands.add_parser("promote", help="copy an approved draft into an executable scenario set")
+    draft_promote.add_argument("draft", type=Path)
+    draft_promote.add_argument("--output-dir", required=True, type=Path)
+    draft_promote.add_argument("--allow-duplicate", action="store_true", help="allow promotion after reviewing an exact-input duplicate")
+
+    gate = commands.add_parser("gate", help="apply risk-based release thresholds to one or more runs")
+    gate.add_argument("scenarios", type=Path, help="scenario YAML file or directory")
+    gate.add_argument("--runs", nargs="+", required=True, type=Path, help="one or more canonical result JSONL files")
+    gate.add_argument("--profile", required=True, type=Path, help="YAML release gate profile")
+    gate.add_argument("--format", choices=("text", "json"), default="text")
+    gate.add_argument("--output", type=Path)
 
     repeat = commands.add_parser("repeat", help="analyze variability across repeated result files")
     repeat.add_argument("scenarios", type=Path, help="scenario YAML file or directory")
@@ -323,6 +356,31 @@ def main(argv: list[str] | None = None) -> int:
             _write_output(args.report, rendered)
             return 0
 
+        if args.command == "drafts":
+            if args.draft_command == "list":
+                drafts_report = list_scenario_drafts(args.directory)
+                if args.format == "json":
+                    rendered = json.dumps({"draft_count": len(drafts_report), "drafts": drafts_report}, indent=2, ensure_ascii=False)
+                else:
+                    lines = [f"Scenario drafts: {len(drafts_report)}", ""]
+                    for item in drafts_report:
+                        duplicate = f" (duplicate input of {item['duplicate_of']})" if item["duplicate_of"] else ""
+                        lines.append(f"  {item['status']:>9}  {item['file']}{duplicate}")
+                    rendered = "\n".join(lines)
+                _write_output(args.output, rendered)
+                return 0
+            if args.draft_command == "review":
+                reviewed = review_scenario_draft(
+                    args.draft, status=args.status, reviewer=args.reviewer, notes=args.notes,
+                )
+                print(json.dumps(reviewed, indent=2, ensure_ascii=False))
+                return 0
+            promoted = promote_scenario_draft(
+                args.draft, args.output_dir, allow_duplicate=args.allow_duplicate,
+            )
+            print(json.dumps(promoted, indent=2, ensure_ascii=False))
+            return 0
+
         if args.command == "history":
             if args.history_command == "trend":
                 report = trend_report(load_history(args.store), limit=args.limit)
@@ -355,6 +413,16 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         all_scenarios = load_scenarios(args.scenarios)
+        if args.command == "gate":
+            profile = load_gate_profile(args.profile)
+            reports = [
+                evaluate(all_scenarios, _selected_results(run_path, all_scenarios, all_scenarios))
+                for run_path in args.runs
+            ]
+            gate_report = evaluate_release_gates(all_scenarios, reports, profile)
+            rendered = json.dumps(gate_report, indent=2, ensure_ascii=False) if args.format == "json" else text_release_gate_report(gate_report)
+            _write_output(args.output, rendered)
+            return 0 if gate_report["passed"] else 1
         if args.command == "scenario-version":
             scenario_dir = args.scenarios if args.scenarios.is_dir() else args.scenarios.parent
             current = scenario_snapshot(all_scenarios, scenario_dir)
@@ -410,6 +478,10 @@ def main(argv: list[str] | None = None) -> int:
                 scenarios, _selected_results(args.candidate, all_scenarios, scenarios), strict=args.strict
             )
             comparison = compare_reports(baseline, candidate)
+            comparison["paired_bootstrap"] = paired_bootstrap_intervals(
+                baseline, candidate, confidence=args.confidence,
+                samples=args.bootstrap_samples, seed=args.seed,
+            )
             if args.github_annotations:
                 annotations, summary = github_annotation_report(comparison, candidate)
                 if annotations:
@@ -456,19 +528,30 @@ def main(argv: list[str] | None = None) -> int:
             report = experiment_matrix(
                 scenarios,
                 [(name, _selected_results(path, all_scenarios, scenarios)) for name, path in specs],
+                confidence=args.confidence, samples=args.bootstrap_samples, seed=args.seed,
             )
             if args.format == "json":
                 rendered = json.dumps(report, indent=2, ensure_ascii=False)
             else:
                 lines = [f"Experiment matrix: {report['variant_count']} variants across {report['scenario_count']} scenarios", ""]
                 for variant in report["variants"]:
-                    lines.extend([f"{variant['name']}: {variant['passed']}/{variant['total']} passed ({variant['pass_rate']:.1%})",
+                    lines.extend([f"{variant['name']}: {variant['passed']}/{variant['total']} passed ({_percent(variant['pass_rate'])})",
                                   f"  models={', '.join(variant['models']) or 'n/a'}, prompt_versions={', '.join(variant['prompt_versions']) or 'n/a'}",
                                   f"  intent={_percent(variant['metrics']['intent_accuracy'])}, tool={_percent(variant['metrics']['tool_accuracy'])}, policy={_percent(variant['metrics']['policy_compliance'])}, unnecessary_questions={_percent(variant['metrics']['unnecessary_question_rate'])}",
                                   f"  cost=${variant['execution']['cost_usd'] if variant['execution']['cost_usd'] is not None else 'n/a'}, input_tokens={variant['execution']['input_tokens'] if variant['execution']['input_tokens'] is not None else 'n/a'}, output_tokens={variant['execution']['output_tokens'] if variant['execution']['output_tokens'] is not None else 'n/a'}, p95_latency_ms={variant['execution']['p95_latency_ms'] if variant['execution']['p95_latency_ms'] is not None else 'n/a'}"])
                     if variant["failed_scenarios"]:
                         lines.append("  failing scenarios: " + ", ".join(variant["failed_scenarios"]))
                     lines.append("")
+                for comparison in report["comparisons"]:
+                    lines.append(
+                        f"Paired comparison {comparison['baseline']} → {comparison['candidate']}: "
+                        f"pass-rate delta {comparison['paired_bootstrap']['metrics']['pass_rate']['estimate']:+.1%}"
+                        if comparison["paired_bootstrap"]["metrics"]["pass_rate"]["estimate"] is not None
+                        else f"Paired comparison {comparison['baseline']} → {comparison['candidate']}: no matched scenarios"
+                    )
+                    interval = comparison["paired_bootstrap"]["metrics"]["pass_rate"]
+                    if interval["lower"] is not None:
+                        lines.append(f"  {interval['confidence']:.0%} interval: {interval['lower']:+.1%} to {interval['upper']:+.1%}")
                 rendered = "\n".join(lines).rstrip()
             _write_output(args.output, rendered)
             return 0
@@ -566,7 +649,7 @@ def main(argv: list[str] | None = None) -> int:
                                        "max_input_tokens": args.max_input_tokens,
                                        "max_output_tokens": args.max_output_tokens,
                                        "max_p95_latency_ms": args.max_p95_latency_ms}})
-    except (AdapterError, DraftError, HistoryError, GraderError, RunnerError, ScenarioError, ResultError, OSError, ValueError) as exc:
+    except (AdapterError, DraftError, GateProfileError, HistoryError, GraderError, RunnerError, ScenarioError, ResultError, OSError, ValueError) as exc:
         print(f"agent-eval: error: {exc}", file=sys.stderr)
         return 2
 

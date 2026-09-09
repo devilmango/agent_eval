@@ -8,7 +8,11 @@ from pathlib import Path
 import yaml
 
 from agent_eval.cli import main
-from agent_eval.drafts import DraftError, create_scenario_drafts
+from agent_eval.drafts import (
+    DraftError, create_scenario_drafts, list_scenario_drafts,
+    promote_scenario_draft, review_scenario_draft,
+)
+from agent_eval.scenarios import load_scenario
 from agent_eval.history import HistoryError, load_history, record_history, trend_report
 
 
@@ -83,6 +87,44 @@ class ScenarioDraftTests(unittest.TestCase):
             self.assertIsNone(draft["expected"]["must_ask"])
             with self.assertRaises(DraftError):
                 create_scenario_drafts(trace_path, mapping_path, "request", output_dir)
+
+    def test_review_detects_duplicates_and_promotes_only_approved_valid_drafts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            mapping = root / "mapping.yaml"
+            traces = root / "traces.jsonl"
+            drafts_dir = root / "drafts"
+            mapping.write_text("fields:\n  scenario: scenario\n  intent: intent\n", encoding="utf-8")
+            trace = {"scenario": "booking", "intent": "BOOK",
+                     "input": {"user": "Book a visit"}}
+            traces.write_text(json.dumps(trace) + "\n" + json.dumps(trace) + "\n", encoding="utf-8")
+            create_scenario_drafts(traces, mapping, "input", drafts_dir)
+            listed = list_scenario_drafts(drafts_dir)
+            self.assertEqual(listed[0]["status"], "pending")
+            self.assertEqual(listed[1]["duplicate_of"], listed[0]["file"])
+
+            first = drafts_dir / listed[0]["file"]
+            with self.assertRaises(DraftError):
+                review_scenario_draft(first, status="approved", reviewer="reviewer")
+            document = yaml.safe_load(first.read_text(encoding="utf-8"))
+            document["expected"] = {"intent": "BOOK", "must_ask": [], "tools": []}
+            document["must_not"] = []
+            first.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
+            review_scenario_draft(first, status="approved", reviewer="reviewer")
+
+            duplicate = drafts_dir / listed[1]["file"]
+            second_document = yaml.safe_load(duplicate.read_text(encoding="utf-8"))
+            second_document["expected"] = {"intent": "BOOK", "must_ask": [], "tools": []}
+            second_document["must_not"] = []
+            duplicate.write_text(yaml.safe_dump(second_document, sort_keys=False), encoding="utf-8")
+            review_scenario_draft(duplicate, status="approved", reviewer="reviewer")
+            with self.assertRaises(DraftError):
+                promote_scenario_draft(duplicate, root / "scenarios")
+
+            promoted = promote_scenario_draft(first, root / "scenarios")
+            parsed = load_scenario(Path(promoted["path"]))
+            self.assertEqual(parsed.intent, "BOOK")
+            self.assertEqual(list_scenario_drafts(drafts_dir)[0]["status"], "promoted")
 
     def test_draft_scenarios_cli_creates_review_files(self):
         with tempfile.TemporaryDirectory() as directory:

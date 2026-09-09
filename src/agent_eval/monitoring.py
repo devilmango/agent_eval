@@ -6,7 +6,7 @@ from math import ceil, isfinite
 from pathlib import Path
 from typing import Any
 
-from agent_eval.comparison import compare_reports
+from agent_eval.comparison import compare_reports, paired_bootstrap_intervals
 from agent_eval.models import AgentResult, EvaluationReport, Scenario
 from agent_eval.scoring import evaluate
 
@@ -58,6 +58,15 @@ def github_annotation_report(
     for metric, delta in comparison["metric_deltas"].items():
         value = "n/a" if delta is None else f"{delta * 100:+.1f} pp"
         rows.append(f"| {metric.replace('_', ' ').capitalize()} | {value} |")
+    intervals = comparison.get("paired_bootstrap", {}).get("metrics", {})
+    if intervals:
+        rows.extend(["", "Paired bootstrap intervals:", "", "| Metric | Estimate | Confidence interval | Paired scenarios |", "| --- | ---: | ---: | ---: |"])
+        for metric, interval in intervals.items():
+            estimate = interval["estimate"]
+            lower, upper = interval["lower"], interval["upper"]
+            estimate_text = "n/a" if estimate is None else f"{estimate * 100:+.1f} pp"
+            interval_text = "n/a" if lower is None else f"{lower * 100:+.1f} to {upper * 100:+.1f} pp"
+            rows.append(f"| {metric.replace('_', ' ').capitalize()} | {estimate_text} | {interval_text} | {interval['paired_scenarios']} |")
     if comparison["regressed_scenarios"]:
         rows.extend(["", "Regressed: " + ", ".join(comparison["regressed_scenarios"])])
     return "\n".join(annotations), "\n".join(rows) + "\n"
@@ -105,11 +114,14 @@ def drift_report(
 
 def experiment_matrix(
     scenarios: list[Scenario], variants: list[tuple[str, dict[str, AgentResult]]],
+    *, confidence: float = 0.95, samples: int = 2000, seed: int = 0,
 ) -> dict[str, Any]:
     """Evaluate named result sets and summarize quality and execution metadata."""
     rows = []
+    evaluations = []
     for name, results in variants:
         report = evaluate(scenarios, results, strict=False)
+        evaluations.append(report)
         costs = _metadata_values(results, "cost_usd")
         input_tokens = _metadata_values(results, "input_tokens")
         output_tokens = _metadata_values(results, "output_tokens")
@@ -139,7 +151,24 @@ def experiment_matrix(
             },
             "failed_scenarios": [score.scenario for score in report.scores if not score.passed],
         })
-    return {"variant_count": len(rows), "scenario_count": len(scenarios), "variants": rows}
+    baseline_name = variants[0][0] if variants else None
+    comparisons = []
+    if evaluations:
+        for index in range(1, len(evaluations)):
+            comparison = compare_reports(evaluations[0], evaluations[index])
+            comparisons.append({
+                "baseline": baseline_name,
+                "candidate": variants[index][0],
+                "metric_deltas": comparison["metric_deltas"],
+                "regressed_scenarios": comparison["regressed_scenarios"],
+                "improved_scenarios": comparison["improved_scenarios"],
+                "paired_bootstrap": paired_bootstrap_intervals(
+                    evaluations[0], evaluations[index], confidence=confidence,
+                    samples=samples, seed=seed,
+                ),
+            })
+    return {"variant_count": len(rows), "scenario_count": len(scenarios),
+            "baseline_variant": baseline_name, "variants": rows, "comparisons": comparisons}
 
 
 def _metadata_values(results: dict[str, AgentResult], key: str) -> list[float]:

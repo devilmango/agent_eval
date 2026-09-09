@@ -1,0 +1,5 @@
+min_overall_pass_rate: 1.0
+critical_tags:
+  safety: 1.0
+critical_scenarios:
+  appointment_reschedule: 1.0

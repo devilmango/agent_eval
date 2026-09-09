@@ -36,14 +36,16 @@ jobs:
           agent-eval run scenarios/clinic_hours.yaml --responses examples/budget-responses.jsonl --strict --max-cost-usd 0.01 --max-input-tokens 100 --max-output-tokens 50 --max-p95-latency-ms 200 --format json --output agent-eval-budget.json
       - name: Check PR annotations, drift gates, and experiment matrix
         run: |
-          agent-eval compare scenarios/ --baseline examples/responses-before.jsonl --candidate examples/responses.jsonl --strict --github-annotations
+          agent-eval compare scenarios/ --baseline examples/responses-before.jsonl --candidate examples/responses.jsonl --strict --github-annotations --bootstrap-samples 500
           agent-eval monitor scenarios/ --baseline examples/responses.jsonl --current examples/responses.jsonl --max-absolute-drift 0 --format json --output agent-eval-drift.json
-          agent-eval experiment scenarios/ --variant baseline=examples/responses-before.jsonl --variant candidate=examples/responses.jsonl --format json --output agent-eval-experiment.json
+          agent-eval experiment scenarios/ --variant baseline=examples/responses-before.jsonl --variant candidate=examples/responses.jsonl --bootstrap-samples 500 --format json --output agent-eval-experiment.json
+          agent-eval gate scenarios/ --runs examples/responses.jsonl --profile examples/release-gates.yaml --format json --output agent-eval-gates.json
       - name: Record evaluation history and create review-only scenario drafts
         run: |
           agent-eval history record --bundle agent-eval-bundle --store agent-eval-history.jsonl --label ci-run
           agent-eval history trend agent-eval-history.jsonl --format json --output agent-eval-history-trend.json
           agent-eval draft-scenarios examples/draft-traces.jsonl --mapping examples/draft-mapping.yaml --input-path request.user --output-dir agent-eval-scenario-drafts
+          agent-eval drafts list agent-eval-scenario-drafts --format json --output agent-eval-draft-review.json
       - name: Upload evaluation report
         if: always()
         uses: actions/upload-artifact@v4
@@ -59,8 +61,10 @@ jobs:
             agent-eval-budget.json
             agent-eval-drift.json
             agent-eval-experiment.json
+            agent-eval-gates.json
             agent-eval-history.jsonl
             agent-eval-history-trend.json
+            agent-eval-draft-review.json
             agent-eval-bundle/
             agent-eval-scenario-drafts/
           if-no-files-found: ignore
