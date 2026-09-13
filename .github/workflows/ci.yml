@@ -44,7 +44,8 @@ jobs:
         run: |
           agent-eval history record --bundle agent-eval-bundle --store agent-eval-history.jsonl --label ci-run
           agent-eval history trend agent-eval-history.jsonl --format json --output agent-eval-history-trend.json
-          agent-eval draft-scenarios examples/draft-traces.jsonl --mapping examples/draft-mapping.yaml --input-path request.user --output-dir agent-eval-scenario-drafts
+          agent-eval history trend agent-eval-history.jsonl --label ci-run --format html --output agent-eval-history.html
+          agent-eval draft-scenarios examples/draft-traces.jsonl --mapping examples/draft-mapping.yaml --input-path request.user --redaction-config examples/trace-redaction.yaml --output-dir agent-eval-scenario-drafts
           agent-eval drafts list agent-eval-scenario-drafts --format json --output agent-eval-draft-review.json
       - name: Upload evaluation report
         if: always()
@@ -64,6 +65,7 @@ jobs:
             agent-eval-gates.json
             agent-eval-history.jsonl
             agent-eval-history-trend.json
+            agent-eval-history.html
             agent-eval-draft-review.json
             agent-eval-bundle/
             agent-eval-scenario-drafts/

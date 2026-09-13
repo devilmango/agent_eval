@@ -31,10 +31,11 @@ The core package has no model-provider or agent-framework dependency. Optional r
 - **Pull request annotations** — surface scenario regressions as GitHub Actions annotations and add a metric comparison to the job summary.
 - **Behavior drift monitoring** — compare sampled current traces with a baseline and fail when metric movement or scenario regressions exceed configured limits.
 - **Model and prompt experiments** — score named result sets side by side, including quality, cost, token usage, and latency metadata.
-- **Evaluation history** — append compact run or bundle summaries to JSONL and inspect pass-rate and metric trends over time.
+- **Evaluation history** — append compact run or bundle summaries to JSONL and inspect filtered pass-rate and metric trends as text, JSON, or HTML.
 - **Trace-to-scenario drafts** — convert observed traces into review-only YAML drafts, track approvals, detect duplicate inputs, and promote reviewed scenarios.
 - **Confidence-aware comparisons** — estimate paired bootstrap intervals for pass rate and scenario-level quality metrics in candidate and experiment comparisons.
 - **Risk-based release gates** — apply separate pass-rate thresholds to the full suite, critical tags, and named scenarios across repeated runs.
+- **Trace redaction** — remove or mask configured fields before raw traces are adapted or turned into scenario drafts.
 
 Built-in checks are deterministic and work over structured traces. Semantic judges are opt-in plugins; the core does not make provider calls or require model credentials.
 
@@ -370,9 +371,14 @@ agent-eval history record --scenarios scenarios/ --responses run.jsonl \
 agent-eval history record --bundle artifacts/agent-eval-bundle \
   --store .agent-eval/history.jsonl --label release-2026-10
 agent-eval history trend .agent-eval/history.jsonl --limit 30
+agent-eval history trend .agent-eval/history.jsonl \
+  --model gpt-example --prompt-version prompt-v4 --label release-2026-10 \
+  --since 2026-10-01 --until 2026-10-31 --format html --output history.html
 ```
 
 `history record` accepts canonical results or a bundle. Bundles are integrity-verified before recording. The append-only JSONL store keeps aggregate metrics, counts, selected execution metadata, and labels; it does not copy scenario inputs or traces. Keep the store with your CI artifacts or durable storage if you need long-term trends.
+
+`history trend` supports exact model, prompt version, and label filters (repeat each flag to match any supplied value), plus inclusive ISO-8601 `--since` and `--until` bounds. Filtering happens before `--limit`, so the limit applies to the latest matching runs. The HTML report is self-contained and escapes stored labels and metadata.
 
 Generate deterministic coverage-guided candidates for human review:
 
@@ -388,10 +394,24 @@ Generate scenario drafts from exported JSONL traces using the same field mapping
 agent-eval draft-scenarios traces.jsonl \
   --mapping examples/draft-mapping.yaml \
   --input-path request.user \
+  --redaction-config examples/trace-redaction.yaml \
   --output-dir scenario-drafts/
 ```
 
-Each YAML file separates `observed` intent, questions, tools, and actions from the `expected` section. Expected values are `null` and the document is marked `draft: true`, so the trace is never silently promoted to an oracle. Output directories must be new. Trace inputs can contain personal or confidential data; sanitize exports before creating drafts.
+Each YAML file separates `observed` intent, questions, tools, and actions from the `expected` section. Expected values are `null` and the document is marked `draft: true`, so the trace is never silently promoted to an oracle. Output directories must be new. Trace inputs can contain personal or confidential data; sanitize exports before creating drafts. A redaction policy runs against each raw trace before adapters read it or draft fields are selected. Rules use dot paths and `[*]` for each item in a list; each rule removes a field or masks it with a configurable replacement:
+
+```yaml
+rules:
+  - path: request.email
+    action: remove
+  - path: request.user
+    action: mask
+    replacement: "[CUSTOMER INPUT REDACTED]"
+  - path: tool_calls[*].arguments.patient_id
+    action: mask
+```
+
+The same `--redaction-config` option is available on `adapt`, `adapt-framework`, and `adapt-otel`. Redaction is opt-in; keep raw exports access-controlled and configure the fields used by your trace schema. See [`examples/trace-redaction.yaml`](examples/trace-redaction.yaml).
 
 Review the generated set, including exact-input duplicates:
 

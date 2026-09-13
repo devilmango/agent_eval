@@ -14,6 +14,7 @@ from typing import Any
 import yaml
 
 from agent_eval.adapters import PathMappingAdapter, resolve_trace_path
+from agent_eval.redaction import load_redaction_rules, redact_document
 from agent_eval.scenarios import ScenarioError, load_scenario
 
 
@@ -159,11 +160,14 @@ def create_scenario_drafts(
     mapping_path: Path,
     input_path: str,
     output_dir: Path,
+    *,
+    redaction_config: Path | None = None,
 ) -> dict[str, Any]:
     """Write incomplete YAML drafts; observed agent behavior never becomes expected behavior."""
     if output_dir.exists():
         raise DraftError(f"draft output directory already exists: {output_dir}")
     adapter = PathMappingAdapter.from_yaml(mapping_path)
+    redaction_rules = load_redaction_rules(redaction_config)
     try:
         lines = traces_path.read_text(encoding="utf-8").splitlines()
     except OSError as exc:
@@ -179,6 +183,7 @@ def create_scenario_drafts(
             raise DraftError(f"{traces_path}:{line_number}: invalid JSON: {exc.msg}") from exc
         if not isinstance(source, dict):
             raise DraftError(f"{traces_path}:{line_number}: each trace record must be an object")
+        source = redact_document(source, redaction_rules)
         try:
             result = adapter.adapt(source)
             user_input = resolve_trace_path(source, input_path)

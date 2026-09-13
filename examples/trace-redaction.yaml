@@ -1,0 +1,8 @@
+rules:
+  - path: request.email
+    action: remove
+  - path: request.user
+    action: mask
+    replacement: "[CUSTOMER INPUT REDACTED]"
+  - path: observations[*].text
+    action: mask

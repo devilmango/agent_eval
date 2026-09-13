@@ -21,12 +21,13 @@ from agent_eval.drafts import (
 )
 from agent_eval.gate_profiles import GateProfileError, evaluate_release_gates, load_gate_profile, text_release_gate_report
 from agent_eval.graders import GraderError, load_judge_registry
-from agent_eval.history import HistoryError, load_history, record_history, text_trend_report, trend_report
+from agent_eval.history import HistoryError, filter_history, html_trend_report, load_history, record_history, text_trend_report, trend_report
 from agent_eval.models import AgentResult
 from agent_eval.monitoring import drift_report, experiment_matrix, github_annotation_report, read_variant_spec
 from agent_eval.otel import OpenTelemetryAdapter, load_otel_document
 from agent_eval.quality import failure_analysis, mutation_report, scenario_coverage, scenario_suggestions, judge_agreement, text_coverage, text_mutation_report, text_failure_analysis
 from agent_eval.report import html_report, json_report, repeated_html_report, text_report
+from agent_eval.redaction import RedactionError, load_redaction_rules, redact_document
 from agent_eval.repeated import analyze_repeated_runs, text_repeated_report
 from agent_eval.results import ResultError, load_results
 from agent_eval.runner import RunnerError, execute_scenarios, load_runner
@@ -64,15 +65,18 @@ def build_parser() -> argparse.ArgumentParser:
     adapt.add_argument("traces", type=Path, help="raw JSON Lines trace file")
     adapt.add_argument("--mapping", required=True, type=Path, help="YAML field-path mapping")
     adapt.add_argument("--output", type=Path, help="output JSONL path (defaults to stdout)")
+    adapt.add_argument("--redaction-config", type=Path, help="YAML rules applied to raw traces before conversion")
 
     framework = commands.add_parser("adapt-framework", help="convert traces with an installed framework adapter")
     framework.add_argument("adapter", help="adapter entry-point name")
     framework.add_argument("traces", type=Path, help="framework trace JSON Lines file")
     framework.add_argument("--output", type=Path, help="output JSONL path (defaults to stdout)")
+    framework.add_argument("--redaction-config", type=Path, help="YAML rules applied to raw traces before conversion")
 
     otel = commands.add_parser("adapt-otel", help="convert an OTLP/JSON trace export into Agent Eval results")
     otel.add_argument("traces", type=Path, help="OTLP/JSON trace export containing resourceSpans")
     otel.add_argument("--output", type=Path, help="output JSONL path (defaults to stdout)")
+    otel.add_argument("--redaction-config", type=Path, help="YAML rules applied to the OTLP document before conversion")
     otel.add_argument("--scenario-attribute", default="agent_eval.scenario")
     otel.add_argument("--intent-attribute", default="agent_eval.intent")
     otel.add_argument(
@@ -127,14 +131,20 @@ def build_parser() -> argparse.ArgumentParser:
     history_trend = history_commands.add_parser("trend", help="summarize metric trends from a history file")
     history_trend.add_argument("store", type=Path, help="evaluation history JSONL")
     history_trend.add_argument("--limit", type=int, help="show only the latest N records")
-    history_trend.add_argument("--format", choices=("text", "json"), default="text")
+    history_trend.add_argument("--format", choices=("text", "json", "html"), default="text")
     history_trend.add_argument("--output", type=Path)
+    history_trend.add_argument("--model", action="append", help="include runs matching this model (repeatable)")
+    history_trend.add_argument("--prompt-version", action="append", help="include runs matching this prompt version (repeatable)")
+    history_trend.add_argument("--label", action="append", help="include runs with this exact label (repeatable)")
+    history_trend.add_argument("--since", help="inclusive ISO-8601 date or timestamp")
+    history_trend.add_argument("--until", help="inclusive ISO-8601 date or timestamp")
 
     drafts = commands.add_parser("draft-scenarios", help="create human-review YAML drafts from trace JSONL")
     drafts.add_argument("traces", type=Path, help="raw trace records as JSON Lines")
     drafts.add_argument("--mapping", required=True, type=Path, help="trace-to-result YAML field mapping")
     drafts.add_argument("--input-path", required=True, help="dot path to the captured user input in each trace")
     drafts.add_argument("--output-dir", required=True, type=Path, help="new directory for review-only YAML drafts")
+    drafts.add_argument("--redaction-config", type=Path, help="YAML rules applied to each raw trace before draft creation")
     drafts.add_argument("--format", choices=("text", "json"), default="text")
     drafts.add_argument("--report", type=Path, help="write the draft creation summary to a file")
 
@@ -251,7 +261,7 @@ def _add_budget_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--max-p95-latency-ms", type=float, help="fail if nearest-rank p95 scenario latency exceeds this value")
 
 
-def _adapt_jsonl(input_path: Path, adapter: PathMappingAdapter) -> list[str]:
+def _adapt_jsonl(input_path: Path, adapter: PathMappingAdapter, redaction_rules=None) -> list[str]:
     try:
         lines = input_path.read_text(encoding="utf-8").splitlines()
     except OSError as exc:
@@ -267,6 +277,7 @@ def _adapt_jsonl(input_path: Path, adapter: PathMappingAdapter) -> list[str]:
             raise AdapterError(f"line {number}: invalid JSON: {exc.msg}") from exc
         if not isinstance(record, dict):
             raise AdapterError(f"line {number}: each trace record must be a JSON object")
+        record = redact_document(record, redaction_rules or [])
         try:
             result = adapter.adapt(record)
         except Exception as exc:
@@ -316,7 +327,7 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "adapt":
             adapter = PathMappingAdapter.from_yaml(args.mapping)
-            output = _adapt_jsonl(args.traces, adapter)
+            output = _adapt_jsonl(args.traces, adapter, load_redaction_rules(args.redaction_config))
             rendered = "\n".join(output) + ("\n" if output else "")
             if args.output:
                 args.output.write_text(rendered, encoding="utf-8")
@@ -326,7 +337,7 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "adapt-framework":
             adapter = load_adapter_plugin(args.adapter)
-            output = _adapt_jsonl(args.traces, adapter)
+            output = _adapt_jsonl(args.traces, adapter, load_redaction_rules(args.redaction_config))
             _write_output(args.output, "\n".join(output))
             return 0
 
@@ -336,7 +347,10 @@ def main(argv: list[str] | None = None) -> int:
                 intent_attribute=args.intent_attribute,
                 include_sensitive_attributes=args.include_sensitive_attributes,
             )
-            results = adapter.adapt_document(load_otel_document(args.traces))
+            trace_document = redact_document(
+                load_otel_document(args.traces), load_redaction_rules(args.redaction_config)
+            )
+            results = adapter.adapt_document(trace_document)
             seen: set[str] = set()
             lines = []
             for result in results:
@@ -348,7 +362,10 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.command == "draft-scenarios":
-            report = create_scenario_drafts(args.traces, args.mapping, args.input_path, args.output_dir)
+            report = create_scenario_drafts(
+                args.traces, args.mapping, args.input_path, args.output_dir,
+                redaction_config=args.redaction_config,
+            )
             rendered = json.dumps(report, indent=2, ensure_ascii=False) if args.format == "json" else (
                 f"Created {report['draft_count']} review-only scenario draft(s) in {report['output_dir']}\n"
                 "Expected behavior fields are blank and require human review."
@@ -383,8 +400,17 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "history":
             if args.history_command == "trend":
-                report = trend_report(load_history(args.store), limit=args.limit)
-                rendered = json.dumps(report, indent=2, ensure_ascii=False) if args.format == "json" else text_trend_report(report)
+                records = filter_history(
+                    load_history(args.store), models=args.model, prompt_versions=args.prompt_version,
+                    labels=args.label, since=args.since, until=args.until,
+                )
+                report = trend_report(records, limit=args.limit)
+                if args.format == "json":
+                    rendered = json.dumps(report, indent=2, ensure_ascii=False)
+                elif args.format == "html":
+                    rendered = html_trend_report(report)
+                else:
+                    rendered = text_trend_report(report)
                 _write_output(args.output, rendered)
                 return 0
             if args.bundle:
@@ -649,7 +675,7 @@ def main(argv: list[str] | None = None) -> int:
                                        "max_input_tokens": args.max_input_tokens,
                                        "max_output_tokens": args.max_output_tokens,
                                        "max_p95_latency_ms": args.max_p95_latency_ms}})
-    except (AdapterError, DraftError, GateProfileError, HistoryError, GraderError, RunnerError, ScenarioError, ResultError, OSError, ValueError) as exc:
+    except (AdapterError, DraftError, GateProfileError, HistoryError, GraderError, RedactionError, RunnerError, ScenarioError, ResultError, OSError, ValueError) as exc:
         print(f"agent-eval: error: {exc}", file=sys.stderr)
         return 2
 

@@ -13,7 +13,7 @@ from agent_eval.drafts import (
     promote_scenario_draft, review_scenario_draft,
 )
 from agent_eval.scenarios import load_scenario
-from agent_eval.history import HistoryError, load_history, record_history, trend_report
+from agent_eval.history import HistoryError, filter_history, html_trend_report, load_history, record_history, trend_report
 
 
 class HistoryTests(unittest.TestCase):
@@ -59,6 +59,50 @@ class HistoryTests(unittest.TestCase):
             }) + "\n", encoding="utf-8")
             with self.assertRaises(HistoryError):
                 load_history(store)
+
+    def test_history_filters_by_model_prompt_label_and_date_and_renders_html(self):
+        base = {
+            "schema_version": 1, "run_id": "one", "recorded_at": "2026-10-13T10:00:00+00:00",
+            "label": "release <one>", "total": 2, "passed": 1, "failed": 1,
+            "pass_rate": 0.5, "metrics": {"intent_accuracy": 0.5},
+            "models": ["model-a"], "prompt_versions": ["prompt-1"],
+        }
+        other = {**base, "run_id": "two", "recorded_at": "2026-10-14T10:00:00+00:00",
+                 "label": "release-two", "models": ["model-b"], "prompt_versions": ["prompt-2"],
+                 "passed": 2, "failed": 0, "pass_rate": 1.0,
+                 "metrics": {"intent_accuracy": 1.0}}
+        selected = filter_history(
+            [base, other], models=["model-a"], prompt_versions=["prompt-1"],
+            labels=["release <one>"], since="2026-10-13", until="2026-10-13",
+        )
+        self.assertEqual([item["run_id"] for item in selected], ["one"])
+        report = trend_report(selected)
+        html = html_trend_report(report)
+        self.assertIn("<!doctype html>", html)
+        self.assertIn("release &lt;one&gt;", html)
+        self.assertNotIn("release <one>", html)
+
+    def test_history_cli_writes_filtered_html(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = root / "history.jsonl"
+            record = {
+                "schema_version": 1, "run_id": "filtered", "recorded_at": "2026-10-13T10:00:00+00:00",
+                "label": "release", "total": 1, "passed": 1, "failed": 0,
+                "pass_rate": 1.0, "metrics": {"intent_accuracy": 1.0},
+                "models": ["model-a"], "prompt_versions": ["prompt-1"],
+            }
+            store.write_text(json.dumps(record) + "\n", encoding="utf-8")
+            output = root / "history.html"
+            with redirect_stdout(StringIO()):
+                status = main([
+                    "history", "trend", str(store), "--model", "model-a",
+                    "--prompt-version", "prompt-1", "--label", "release",
+                    "--since", "2026-10-13", "--until", "2026-10-13",
+                    "--format", "html", "--output", str(output),
+                ])
+            self.assertEqual(status, 0)
+            self.assertIn("Evaluation history", output.read_text(encoding="utf-8"))
 
 
 class ScenarioDraftTests(unittest.TestCase):
@@ -143,6 +187,34 @@ class ScenarioDraftTests(unittest.TestCase):
                 ])
             self.assertEqual(status, 0)
             self.assertEqual(len(list(output.glob("*.yaml"))), 1)
+
+    def test_trace_redaction_is_applied_before_creating_drafts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            mapping = root / "mapping.yaml"
+            traces = root / "traces.jsonl"
+            policy = root / "redaction.yaml"
+            output = root / "drafts"
+            mapping.write_text("fields:\n  scenario: scenario\n  intent: intent\n", encoding="utf-8")
+            traces.write_text(json.dumps({
+                "scenario": "booking", "intent": "BOOK",
+                "request": {"user": "Call me at 555-0100", "email": "person@example.test"},
+                "observations": [{"text": "customer said sensitive words"}],
+            }) + "\n", encoding="utf-8")
+            policy.write_text(
+                "rules:\n"
+                "  - path: request.email\n    action: remove\n"
+                "  - path: request.user\n    action: mask\n"
+                "  - path: observations[*].text\n    action: mask\n",
+                encoding="utf-8",
+            )
+            create_scenario_drafts(traces, mapping, "request", output, redaction_config=policy)
+            draft_text = next(output.glob("*.yaml")).read_text(encoding="utf-8")
+            draft = yaml.safe_load(draft_text)
+            self.assertEqual(draft["input"]["user"], "[REDACTED]")
+            self.assertNotIn("email", draft_text)
+            self.assertNotIn("555-0100", draft_text)
+            self.assertNotIn("sensitive words", draft_text)
 
 
 class HistoryCliTests(unittest.TestCase):

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import json
+from html import escape
 from math import isfinite
 from pathlib import Path
 from typing import Any
@@ -118,6 +119,96 @@ def trend_report(records: list[dict[str, Any]], *, limit: int | None = None) -> 
         "deltas": deltas,
         "runs": selected,
     }
+
+
+def filter_history(
+    records: list[dict[str, Any]], *, models: list[str] | None = None,
+    prompt_versions: list[str] | None = None, labels: list[str] | None = None,
+    since: str | None = None, until: str | None = None,
+) -> list[dict[str, Any]]:
+    """Filter history records by metadata and inclusive ISO-8601 date bounds."""
+    since_time = _parse_date_bound(since, "--since") if since else None
+    until_time = _parse_date_bound(until, "--until", end_of_day=True) if until else None
+    if since_time and until_time and since_time > until_time:
+        raise HistoryError("--since must be earlier than or equal to --until")
+    selected = []
+    for record in records:
+        try:
+            recorded_time = datetime.fromisoformat(record["recorded_at"].replace("Z", "+00:00"))
+        except (TypeError, ValueError) as exc:
+            raise HistoryError("history record has an invalid recorded_at timestamp") from exc
+        if recorded_time.tzinfo is None:
+            recorded_time = recorded_time.replace(tzinfo=timezone.utc)
+        recorded_time = recorded_time.astimezone(timezone.utc)
+        record_models = record.get("models", [])
+        record_prompts = record.get("prompt_versions", [])
+        if models and not set(models).intersection(record_models):
+            continue
+        if prompt_versions and not set(prompt_versions).intersection(record_prompts):
+            continue
+        if labels and record.get("label") not in labels:
+            continue
+        if since_time and recorded_time < since_time:
+            continue
+        if until_time and recorded_time > until_time:
+            continue
+        selected.append(record)
+    return selected
+
+
+def _parse_date_bound(value: str, flag: str, *, end_of_day: bool = False) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise HistoryError(f"{flag} must be an ISO-8601 date or timestamp") from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    if end_of_day and len(value) == 10:
+        parsed = parsed.replace(hour=23, minute=59, second=59, microsecond=999999)
+    return parsed.astimezone(timezone.utc)
+
+
+def html_trend_report(report: dict[str, Any]) -> str:
+    """Render a self-contained, escaped HTML history report."""
+    runs = report["runs"]
+    first, latest = report["first"], report["latest"]
+    metric_names = sorted(set(first["metrics"]) | set(latest["metrics"]))
+    delta_rows = "".join(
+        "<tr>" + f"<th scope=\"row\">{escape(name.replace('_', ' '))}</th>"
+        + f"<td>{escape(_delta_text(report['deltas'].get(name)))}</td></tr>"
+        for name in metric_names
+    )
+    rows = []
+    for run in runs:
+        metrics = run.get("metrics", {})
+        model_names = ", ".join(run.get("models", [])) or "—"
+        prompt_names = ", ".join(run.get("prompt_versions", [])) or "—"
+        rows.append(
+            "<tr>"
+            f"<td>{escape(run['recorded_at'])}</td>"
+            f"<th scope=\"row\">{escape(str(run.get('label') or run['run_id']))}</th>"
+            f"<td>{run['passed']}/{run['total']} ({escape(format_rate(run.get('pass_rate')))})</td>"
+            f"<td>{escape(model_names)}</td><td>{escape(prompt_names)}</td>"
+            + "".join(f"<td>{escape(format_rate(metrics.get(name)))}</td>" for name in metric_names)
+            + "</tr>"
+        )
+    metric_headers = "".join(f"<th scope=\"col\">{escape(name.replace('_', ' '))}</th>" for name in metric_names)
+    return """<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agent Eval history</title><style>
+body{font:16px/1.5 system-ui,sans-serif;margin:2rem auto;padding:0 1rem;max-width:1200px;color:#17202a;background:#fff}
+h1,h2{line-height:1.2}table{border-collapse:collapse;width:100%;margin:1rem 0 2rem}caption{text-align:left;font-weight:600;margin:.5rem 0}
+th,td{text-align:left;padding:.55rem .7rem;border-bottom:1px solid #d8dee4;vertical-align:top}thead{background:#f3f6f8}
+.summary{display:flex;gap:2rem;flex-wrap:wrap}.summary p{margin:.3rem 0}
+</style></head><body>
+""" + f"""<header><p>Agent Eval</p><h1>Evaluation history</h1><p>{report['run_count']} matching runs</p></header>
+<section><h2>Latest run</h2><div class="summary"><p><strong>Label:</strong> {escape(str(latest.get('label') or latest['run_id']))}</p>
+<p><strong>Recorded:</strong> {escape(latest['recorded_at'])}</p><p><strong>Pass rate:</strong> {escape(format_rate(latest.get('pass_rate')))}</p></div></section>
+<section><h2>Change across selected runs</h2><table><caption>Latest minus earliest retained run</caption><tbody>
+<tr><th scope="row">Pass rate</th><td>{escape(_delta(first.get('pass_rate'), latest.get('pass_rate')))}</td></tr>{delta_rows}
+</tbody></table></section>
+<section><h2>Runs</h2><table><caption>Filtered evaluation history</caption><thead><tr><th scope="col">Recorded</th><th scope="col">Label / run ID</th><th scope="col">Pass rate</th><th scope="col">Models</th><th scope="col">Prompt versions</th>{metric_headers}</tr></thead>
+<tbody>{''.join(rows)}</tbody></table></section></body></html>"""
 
 
 def text_trend_report(report: dict[str, Any]) -> str:
