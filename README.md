@@ -183,6 +183,9 @@ must_not:
 allowed_questions:
   - appointment_date
 tags: [scheduling, safety]
+owner: care-operations
+severity: critical
+reviewed_at: "2026-10-14"
 ```
 
 ### Scenario fields
@@ -200,7 +203,18 @@ tags: [scheduling, safety]
 | `allowed_questions` | No | Additional question identifiers permitted for this scenario. |
 | `expected.answer_graders` | No | Deterministic checks or installed grader plugins applied to the agent's final answer. |
 | `tags` | No | Labels for selecting related scenarios from the CLI. |
+| `owner` | No | Team or person responsible for keeping the scenario current. |
+| `severity` | No | Risk level: critical, high, medium, or low. |
+| `reviewed_at` | No | Date of the most recent human review, in YYYY-MM-DD format. |
 | `turns` | No | Ordered conversation inputs with optional expectations for each turn. Use instead of `input`. |
+
+Audit ownership and review freshness for every critical scenario; the command fails when a critical case lacks an owner or current review:
+
+```bash
+agent-eval scenario-audit scenarios/ --max-review-age-days 90 --format json
+```
+
+Use `--as-of YYYY-MM-DD` to run the audit against a fixed date. Scenario severity is included in scenario-set contract snapshots; owner and review date are governance metadata and do not change the behavior contract.
 
 Version the set with `scenarios/scenario-set.yaml`:
 
@@ -413,6 +427,21 @@ rules:
 
 The same `--redaction-config` option is available on `adapt`, `adapt-framework`, and `adapt-otel`. Redaction is opt-in; keep raw exports access-controlled and configure the fields used by your trace schema. See [`examples/trace-redaction.yaml`](examples/trace-redaction.yaml).
 
+Audit rule coverage before processing a batch. Rules marked `required: true` should match every trace record; `--strict` makes missing matches fail a CI step. Optional rules still report match counts and unmatched records:
+
+```yaml
+rules:
+  - path: request.user
+    action: mask
+    required: true
+  - path: request.email
+    action: remove
+```
+
+```bash
+agent-eval redaction-audit traces.jsonl --config redaction.yaml --strict --format json
+```
+
 Review the generated set, including exact-input duplicates:
 
 ```bash
@@ -505,7 +534,7 @@ agent-eval repeat scenarios/ \
   --strict
 ```
 
-Agent Eval analyzes supplied result files; it does not launch the agent or choose a model sampling configuration. The report includes each metric's mean, sample standard deviation, and observed range, plus per-scenario pass frequency and the run numbers that failed. `repeat` requires at least two runs and exits `1` if any run has failed scenarios.
+Agent Eval analyzes supplied result files; it does not launch the agent or choose a model sampling configuration. The report includes each metric's mean, sample standard deviation, and observed range, plus per-scenario pass frequency and the run numbers that failed. It identifies scenarios that pass in some runs and fail in others, groups their failure reasons, and summarizes instability by scenario tag, recorded model, and prompt version. `repeat` requires at least two runs and exits `1` if any run has failed scenarios.
 
 Repeated-run reports also include Wilson score confidence intervals for the overall and per-scenario pass rates. Gate a release on the lower confidence bound with `--min-pass-rate`; the gate fails if the lower bound is below the requested threshold, even when the observed pass rate is higher. Set `--confidence` (default `0.95`) to a value between `0.5` and `1`, and `--min-runs` (default `2`) to require a minimum number of captures:
 

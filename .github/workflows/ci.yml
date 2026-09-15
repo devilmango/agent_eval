@@ -32,6 +32,7 @@ jobs:
       - name: Check scenario version snapshot, failure analysis, and execution budgets
         run: |
           agent-eval scenario-version scenarios/ --format json --output agent-eval-scenario-version.json
+          agent-eval scenario-audit scenarios/ --max-review-age-days 90 --format json --output agent-eval-scenario-audit.json
           agent-eval triage scenarios/ --responses examples/responses.jsonl --format json --output agent-eval-triage.json
           agent-eval run scenarios/clinic_hours.yaml --responses examples/budget-responses.jsonl --strict --max-cost-usd 0.01 --max-input-tokens 100 --max-output-tokens 50 --max-p95-latency-ms 200 --format json --output agent-eval-budget.json
       - name: Check PR annotations, drift gates, and experiment matrix
@@ -42,6 +43,7 @@ jobs:
           agent-eval gate scenarios/ --runs examples/responses.jsonl --profile examples/release-gates.yaml --format json --output agent-eval-gates.json
       - name: Record evaluation history and create review-only scenario drafts
         run: |
+          agent-eval redaction-audit examples/draft-traces.jsonl --config examples/trace-redaction.yaml --strict --format json --output agent-eval-redaction-audit.json
           agent-eval history record --bundle agent-eval-bundle --store agent-eval-history.jsonl --label ci-run
           agent-eval history trend agent-eval-history.jsonl --format json --output agent-eval-history-trend.json
           agent-eval history trend agent-eval-history.jsonl --label ci-run --format html --output agent-eval-history.html
@@ -58,6 +60,7 @@ jobs:
             agent-eval-coverage.json
             agent-eval-mutations.json
             agent-eval-scenario-version.json
+            agent-eval-scenario-audit.json
             agent-eval-triage.json
             agent-eval-budget.json
             agent-eval-drift.json
@@ -66,6 +69,7 @@ jobs:
             agent-eval-history.jsonl
             agent-eval-history-trend.json
             agent-eval-history.html
+            agent-eval-redaction-audit.json
             agent-eval-draft-review.json
             agent-eval-bundle/
             agent-eval-scenario-drafts/

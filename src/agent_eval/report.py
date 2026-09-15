@@ -167,6 +167,30 @@ def repeated_html_report(report: dict) -> str:
             f"<td>{scenario['pass_rate'] * 100:.1f}% (Wilson {scenario['confidence_interval']['lower'] * 100:.1f}–{scenario['confidence_interval']['upper'] * 100:.1f}%)</td>"
             f"<td>{escape(failed_runs)}</td></tr>"
         )
+    flaky_rows = []
+    for scenario in report.get("flaky_scenarios", []):
+        reasons = ", ".join(
+            f"{name}: {count}" for name, count in scenario.get("failure_reasons", {}).items()
+        ) or "No classified failure reason"
+        flaky_rows.append(
+            f"<tr><th scope=\"row\">{escape(scenario['scenario'])}</th>"
+            f"<td>{escape(', '.join(scenario.get('tags', [])) or '—')}</td>"
+            f"<td>{escape(reasons)}</td></tr>"
+        )
+    slice_sections = []
+    for label, key in (("Tag", "by_tag"), ("Model", "by_model"), ("Prompt version", "by_prompt_version")):
+        rows = "".join(
+            f"<tr><th scope=\"row\">{escape(item['slice'])}</th>"
+            f"<td>{item['pass_rate'] * 100:.1f}%</td>"
+            f"<td>{escape(', '.join(item['flaky_scenarios']) or '—')}</td></tr>"
+            for item in report.get(key, [])
+        )
+        if rows:
+            slice_sections.append(
+                f"<h3>By {escape(label.lower())}</h3><table><thead><tr>"
+                f"<th scope=\"col\">{escape(label)}</th><th scope=\"col\">Pass rate</th>"
+                f"<th scope=\"col\">Flaky scenarios</th></tr></thead><tbody>{rows}</tbody></table>"
+            )
     return _document(
         "Agent Eval repeated-run report",
         f"""
@@ -197,6 +221,15 @@ def repeated_html_report(report: dict) -> str:
             <thead><tr><th scope="col">Scenario</th><th scope="col">Passed runs</th><th scope="col">Pass rate</th><th scope="col">Failed run numbers</th></tr></thead>
             <tbody>{''.join(scenario_rows)}</tbody>
           </table>
+        </section>
+        <section aria-labelledby="flakiness-heading">
+          <h2 id="flakiness-heading">Flakiness analysis</h2>
+          <p>{len(report.get('flaky_scenarios', []))} scenarios passed in some runs and failed in others.</p>
+          <table><caption>Intermittent failures and their reason counts</caption>
+            <thead><tr><th scope="col">Scenario</th><th scope="col">Tags</th><th scope="col">Failure reasons</th></tr></thead>
+            <tbody>{''.join(flaky_rows) or '<tr><td colspan="3">No flaky scenarios</td></tr>'}</tbody>
+          </table>
+          {''.join(slice_sections)}
         </section>
         """,
     )

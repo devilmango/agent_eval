@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import date
 from pathlib import Path
 from typing import Any
 
@@ -166,6 +167,22 @@ def load_scenario(path: Path) -> Scenario:
     scenario_version = document.get("version", 1)
     if isinstance(scenario_version, bool) or not isinstance(scenario_version, int) or scenario_version < 1:
         raise ScenarioError(f"{path}: 'version' must be a positive integer")
+    owner = document.get("owner")
+    if owner is not None and (not isinstance(owner, str) or not owner.strip()):
+        raise ScenarioError(f"{path}: 'owner' must be a non-empty string when supplied")
+    severity = document.get("severity")
+    if severity is not None and (
+        not isinstance(severity, str) or severity not in {"critical", "high", "medium", "low"}
+    ):
+        raise ScenarioError(f"{path}: 'severity' must be critical, high, medium, or low")
+    reviewed_at = document.get("reviewed_at")
+    if reviewed_at is not None:
+        if not isinstance(reviewed_at, str):
+            raise ScenarioError(f"{path}: 'reviewed_at' must be an ISO-8601 date")
+        try:
+            date.fromisoformat(reviewed_at)
+        except ValueError as exc:
+            raise ScenarioError(f"{path}: 'reviewed_at' must be an ISO-8601 date (YYYY-MM-DD)") from exc
 
     return Scenario(
         name=name,
@@ -184,6 +201,9 @@ def load_scenario(path: Path) -> Scenario:
         turns=tuple(turns),
         tool_fixtures=tuple(fixtures),
         version=scenario_version,
+        owner=owner.strip() if isinstance(owner, str) else None,
+        severity=severity,
+        reviewed_at=reviewed_at,
     )
 
 

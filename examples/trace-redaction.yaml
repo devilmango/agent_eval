@@ -3,6 +3,7 @@ rules:
     action: remove
   - path: request.user
     action: mask
+    required: true
     replacement: "[CUSTOMER INPUT REDACTED]"
   - path: observations[*].text
     action: mask

@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from statistics import NormalDist, mean, stdev
 from typing import Any
 
 from agent_eval.models import EvaluationReport
+from agent_eval.models import Scenario
 
 
 METRICS = (
@@ -42,7 +44,8 @@ def wilson_interval(successes: int, trials: int, confidence: float = 0.95) -> tu
 
 
 def analyze_repeated_runs(
-    reports: list[EvaluationReport], *, confidence: float = 0.95
+    reports: list[EvaluationReport], *, confidence: float = 0.95,
+    scenarios: list[Scenario] | None = None,
 ) -> dict[str, Any]:
     if len(reports) < 2:
         raise ValueError("Repeated-run analysis requires at least two evaluation runs")
@@ -74,11 +77,18 @@ def analyze_repeated_runs(
         execution[metric] = _statistics(observed) if observed else {"mean": None, "sample_stddev": None, "min": None, "max": None}
 
     scenario_rows: list[dict[str, Any]] = []
+    tag_lookup = {scenario.name: scenario.tags for scenario in scenarios or []}
+    failure_totals: Counter[str] = Counter()
     for name in scenario_names:
-        outcomes = [
-            next(score.passed for score in report.scores if score.scenario == name)
+        matching_scores = [
+            next(score for score in report.scores if score.scenario == name)
             for report in reports
         ]
+        outcomes = [score.passed for score in matching_scores]
+        reasons: Counter[str] = Counter(
+            reason for score in matching_scores for reason in _failure_reasons(score)
+        )
+        failure_totals.update(reasons)
         passed = sum(outcomes)
         scenario_lower, scenario_upper = wilson_interval(passed, len(outcomes), confidence)
         scenario_rows.append(
@@ -87,6 +97,9 @@ def analyze_repeated_runs(
                 "passed_runs": passed,
                 "total_runs": len(outcomes),
                 "pass_rate": passed / len(outcomes),
+                "flaky": 0 < passed < len(outcomes),
+                "tags": list(tag_lookup.get(name, ())),
+                "failure_reasons": dict(sorted(reasons.items())),
                 "confidence_interval": {
                     "lower": scenario_lower,
                     "upper": scenario_upper,
@@ -94,6 +107,10 @@ def analyze_repeated_runs(
                 "failed_run_numbers": [index for index, outcome in enumerate(outcomes, start=1) if not outcome],
             }
         )
+
+    by_tag = _scenario_slices(scenario_rows, lambda row: row["tags"])
+    by_model = _run_slices(reports, scenario_names, "models")
+    by_prompt = _run_slices(reports, scenario_names, "prompt_versions")
 
     return {
         "runs": len(reports),
@@ -104,7 +121,90 @@ def analyze_repeated_runs(
         "metrics": metrics,
         "execution": execution,
         "scenarios": scenario_rows,
+        "flaky_scenarios": [row for row in scenario_rows if row["flaky"]],
+        "failure_reasons": dict(sorted(failure_totals.items())),
+        "by_tag": by_tag,
+        "by_model": by_model,
+        "by_prompt_version": by_prompt,
     }
+
+
+def _failure_reasons(score: Any) -> list[str]:
+    if score.passed:
+        return []
+    reasons = []
+    if score.actual_intent == "(missing result)":
+        reasons.append("missing_result")
+    else:
+        if not score.intent_correct:
+            reasons.append("wrong_intent")
+        if score.missing_questions:
+            reasons.append("missing_required_question")
+        if score.unnecessary_questions:
+            reasons.append("unnecessary_question")
+        if score.tool_correct is False:
+            reasons.append("tool_mismatch")
+        if score.policy_violations:
+            reasons.append("policy_violation")
+        if score.turn_violations:
+            reasons.append("turn_violation")
+        if any(not grade.passed for grade in score.answer_grades):
+            reasons.append("answer_grader")
+        if not reasons:
+            reasons.append("other")
+    return reasons
+
+
+def _scenario_slices(
+    scenario_rows: list[dict[str, Any]], selector,
+) -> list[dict[str, Any]]:
+    members: dict[str, list[dict[str, Any]]] = {}
+    for row in scenario_rows:
+        for key in selector(row):
+            members.setdefault(key, []).append(row)
+    return [
+        {
+            "slice": key,
+            "scenario_count": len(rows),
+            "passed_runs": sum(row["passed_runs"] for row in rows),
+            "total_runs": sum(row["total_runs"] for row in rows),
+            "pass_rate": sum(row["passed_runs"] for row in rows) / sum(row["total_runs"] for row in rows),
+            "flaky_scenarios": [row["scenario"] for row in rows if row["flaky"]],
+        }
+        for key, rows in sorted(members.items())
+    ]
+
+
+def _run_slices(
+    reports: list[EvaluationReport], scenario_names: list[str], field: str,
+) -> list[dict[str, Any]]:
+    run_groups: dict[str, list[EvaluationReport]] = {}
+    for report in reports:
+        for value in report.execution.get(field, []):
+            run_groups.setdefault(str(value), []).append(report)
+    slices = []
+    for value, selected in sorted(run_groups.items()):
+        outcomes_by_scenario: dict[str, list[bool]] = {name: [] for name in scenario_names}
+        passed = 0
+        total = 0
+        for report in selected:
+            for score in report.scores:
+                outcomes_by_scenario[score.scenario].append(score.passed)
+                passed += int(score.passed)
+                total += 1
+        slices.append({
+            "slice": value,
+            "run_count": len(selected),
+            "scenario_count": len(scenario_names),
+            "passed_runs": passed,
+            "total_runs": total,
+            "pass_rate": passed / total if total else 0.0,
+            "flaky_scenarios": [
+                name for name, outcomes in outcomes_by_scenario.items()
+                if any(outcomes) and not all(outcomes)
+            ],
+        })
+    return slices
 
 
 def text_repeated_report(report: dict[str, Any]) -> str:
@@ -136,6 +236,19 @@ def text_repeated_report(report: dict[str, Any]) -> str:
             f"{scenario['confidence_interval']['lower'] * 100:.1f}–"
             f"{scenario['confidence_interval']['upper'] * 100:.1f}%)"
         )
+    flaky = report["flaky_scenarios"]
+    lines.extend(["", f"Flaky scenarios: {len(flaky)}"])
+    for scenario in flaky:
+        reasons = ", ".join(f"{name}={count}" for name, count in scenario["failure_reasons"].items()) or "no classified reason"
+        lines.append(f"  {scenario['scenario']}: {reasons}")
+    for heading, key in (("By tag", "by_tag"), ("By model", "by_model"), ("By prompt version", "by_prompt_version")):
+        if report[key]:
+            lines.extend(["", heading + ":"])
+            for item in report[key]:
+                lines.append(
+                    f"  {item['slice']}: {item['pass_rate'] * 100:.1f}% pass rate; "
+                    f"{len(item['flaky_scenarios'])} flaky scenario(s)"
+                )
     return "\n".join(lines)
 
 

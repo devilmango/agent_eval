@@ -30,7 +30,7 @@ def _semver(value: Any, source: str) -> tuple[int, int, int]:
 
 
 def _contract(scenario: Scenario) -> dict[str, Any]:
-    return {
+    contract = {
         "input": scenario.input,
         "intent": scenario.intent,
         "must_ask": scenario.must_ask,
@@ -50,6 +50,9 @@ def _contract(scenario: Scenario) -> dict[str, Any]:
         ],
         "tags": scenario.tags,
     }
+    if scenario.severity is not None:
+        contract["severity"] = scenario.severity
+    return contract
 
 
 def snapshot(scenarios: list[Scenario], scenario_dir: Path) -> dict[str, Any]:

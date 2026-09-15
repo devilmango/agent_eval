@@ -1,7 +1,9 @@
 import unittest
 
-from agent_eval.models import EvaluationReport, ScenarioScore
+from agent_eval.models import AgentResult, EvaluationReport, Scenario, ScenarioScore
 from agent_eval.repeated import analyze_repeated_runs, wilson_interval
+from agent_eval.report import repeated_html_report
+from agent_eval.scoring import evaluate
 
 
 def make_report(passed: bool) -> EvaluationReport:
@@ -63,3 +65,35 @@ class RepeatedRunTests(unittest.TestCase):
         lower, upper = wilson_interval(6, 6)
         self.assertAlmostEqual(lower, 0.6097, places=3)
         self.assertEqual(upper, 1.0)
+
+    def test_flakiness_report_groups_reasons_and_run_instability_slices(self):
+        scenario = Scenario(
+            name="booking", input={"user": "book"}, intent="BOOK",
+            must_ask=("identity",), tags=("safety", "booking"),
+        )
+        passed = evaluate(
+            [scenario], {"booking": AgentResult(
+                "booking", "BOOK", asked=("identity",),
+                metadata={"model": "model-a", "prompt_version": "prompt-a"},
+            )},
+        )
+        failed = evaluate(
+            [scenario], {"booking": AgentResult(
+                "booking", "OTHER",
+                metadata={"model": "model-b", "prompt_version": "prompt-b"},
+            )},
+        )
+        report = analyze_repeated_runs([passed, failed], scenarios=[scenario])
+        self.assertEqual(len(report["flaky_scenarios"]), 1)
+        row = report["flaky_scenarios"][0]
+        self.assertEqual(row["tags"], ["safety", "booking"])
+        self.assertEqual(row["failure_reasons"], {
+            "missing_required_question": 1, "wrong_intent": 1,
+        })
+        self.assertEqual(report["by_tag"][0]["flaky_scenarios"], ["booking"])
+        self.assertEqual({item["slice"] for item in report["by_model"]}, {"model-a", "model-b"})
+        self.assertEqual({item["slice"] for item in report["by_prompt_version"]}, {"prompt-a", "prompt-b"})
+        html = repeated_html_report(report)
+        self.assertIn("Flakiness analysis", html)
+        self.assertIn("wrong_intent", html)
+        self.assertIn("By model", html)

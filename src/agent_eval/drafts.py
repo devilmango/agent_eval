@@ -86,7 +86,7 @@ def promote_scenario_draft(
     promoted = {
         key: document[key]
         for key in ("scenario", "version", "input", "turns", "expected", "must_not",
-                    "allowed_questions", "tags", "tool_fixtures")
+                    "allowed_questions", "tags", "tool_fixtures", "owner", "severity", "reviewed_at")
         if key in document
     }
     temporary_path: Path | None = None

@@ -80,6 +80,9 @@ class Scenario:
     turns: tuple[ScenarioTurn, ...] = ()
     tool_fixtures: tuple[dict[str, Any], ...] = ()
     version: int = 1
+    owner: str | None = None
+    severity: str | None = None
+    reviewed_at: str | None = None
 
 
 @dataclass(frozen=True)

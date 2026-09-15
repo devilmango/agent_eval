@@ -42,6 +42,44 @@ class TraceRedactionTests(unittest.TestCase):
             with self.assertRaises(RedactionError):
                 load_redaction_rules(policy)
 
+    def test_audit_reports_coverage_and_strictly_gates_required_rules(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            policy = root / "redaction.yaml"
+            traces = root / "traces.jsonl"
+            report_path = root / "audit.json"
+            policy.write_text(
+                "rules:\n"
+                "  - path: request.user\n    action: mask\n    required: true\n"
+                "  - path: request.email\n    action: remove\n"
+                "  - path: request.phone\n    action: remove\n",
+                encoding="utf-8",
+            )
+            traces.write_text(
+                json.dumps({"request": {"user": "first", "email": "a@example.test"}}) + "\n"
+                + json.dumps({"request": {"user": "second"}}) + "\n",
+                encoding="utf-8",
+            )
+            status = main([
+                "redaction-audit", str(traces), "--config", str(policy), "--strict",
+                "--format", "json", "--output", str(report_path),
+            ])
+            self.assertEqual(status, 0)
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            self.assertTrue(report["passed"])
+            self.assertEqual(report["rules"][0]["matches"], 2)
+            self.assertEqual(report["rules"][1]["unmatched_records"], 1)
+            self.assertFalse(report["rules"][2]["matched"])
+            traces.write_text(
+                json.dumps({"request": {"email": "a@example.test"}}) + "\n", encoding="utf-8"
+            )
+            status = main([
+                "redaction-audit", str(traces), "--config", str(policy), "--strict",
+                "--format", "json", "--output", str(report_path),
+            ])
+            self.assertEqual(status, 1)
+            self.assertFalse(json.loads(report_path.read_text(encoding="utf-8"))["passed"])
+
     def test_adapt_cli_redacts_before_writing_canonical_results(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

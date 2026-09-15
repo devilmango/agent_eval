@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import date
 import json
 import os
 import sys
@@ -27,12 +28,16 @@ from agent_eval.monitoring import drift_report, experiment_matrix, github_annota
 from agent_eval.otel import OpenTelemetryAdapter, load_otel_document
 from agent_eval.quality import failure_analysis, mutation_report, scenario_coverage, scenario_suggestions, judge_agreement, text_coverage, text_mutation_report, text_failure_analysis
 from agent_eval.report import html_report, json_report, repeated_html_report, text_report
-from agent_eval.redaction import RedactionError, load_redaction_rules, redact_document
+from agent_eval.redaction import (
+    RedactionError, audit_redaction_file, load_redaction_rules,
+    redact_document, text_redaction_audit,
+)
 from agent_eval.repeated import analyze_repeated_runs, text_repeated_report
 from agent_eval.results import ResultError, load_results
 from agent_eval.runner import RunnerError, execute_scenarios, load_runner
 from agent_eval.scenarios import ScenarioError, filter_scenarios, load_scenarios
 from agent_eval.scoring import evaluate
+from agent_eval.scenario_audit import audit_scenarios, text_scenario_audit
 from agent_eval.versioning import VersioningError, compare_snapshots, migrate_scenario_versions, snapshot as scenario_snapshot, text_version_report, write_manifest
 
 
@@ -147,6 +152,20 @@ def build_parser() -> argparse.ArgumentParser:
     drafts.add_argument("--redaction-config", type=Path, help="YAML rules applied to each raw trace before draft creation")
     drafts.add_argument("--format", choices=("text", "json"), default="text")
     drafts.add_argument("--report", type=Path, help="write the draft creation summary to a file")
+
+    redaction_audit = commands.add_parser("redaction-audit", help="check configured redaction rule coverage over JSONL traces")
+    redaction_audit.add_argument("traces", type=Path, help="raw trace records as JSON Lines")
+    redaction_audit.add_argument("--config", required=True, type=Path, help="redaction policy YAML")
+    redaction_audit.add_argument("--strict", action="store_true", help="fail when any required rule misses a trace record")
+    redaction_audit.add_argument("--format", choices=("text", "json"), default="text")
+    redaction_audit.add_argument("--output", type=Path)
+
+    scenario_audit = commands.add_parser("scenario-audit", help="check owners and review freshness for critical scenarios")
+    scenario_audit.add_argument("scenarios", type=Path, help="scenario YAML file or directory")
+    scenario_audit.add_argument("--max-review-age-days", type=int, default=90)
+    scenario_audit.add_argument("--as-of", help="date used for review-age calculation (YYYY-MM-DD)")
+    scenario_audit.add_argument("--format", choices=("text", "json"), default="text")
+    scenario_audit.add_argument("--output", type=Path)
 
     draft_admin = commands.add_parser("drafts", help="list, review, and promote trace-derived scenario drafts")
     draft_commands = draft_admin.add_subparsers(dest="draft_command", required=True)
@@ -316,6 +335,15 @@ def main(argv: list[str] | None = None) -> int:
             _write_output(args.output, rendered)
             return 0 if verification["valid"] else 1
 
+        if args.command == "redaction-audit":
+            rules = load_redaction_rules(args.config)
+            if not rules:
+                raise RedactionError("redaction policy must define at least one rule")
+            report = audit_redaction_file(args.traces, rules)
+            rendered = json.dumps(report, indent=2, ensure_ascii=False) if args.format == "json" else text_redaction_audit(report)
+            _write_output(args.output, rendered)
+            return 1 if args.strict and not report["passed"] else 0
+
         if args.command == "calibrate-judge":
             report = calibrate_judge(
                 args.gold_set, args.judge, load_judge_registry(), model=args.model,
@@ -439,6 +467,14 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         all_scenarios = load_scenarios(args.scenarios)
+        if args.command == "scenario-audit":
+            audit_date = date.fromisoformat(args.as_of) if args.as_of else None
+            report = audit_scenarios(
+                all_scenarios, max_review_age_days=args.max_review_age_days, as_of=audit_date,
+            )
+            rendered = json.dumps(report, indent=2, ensure_ascii=False) if args.format == "json" else text_scenario_audit(report)
+            _write_output(args.output, rendered)
+            return 0 if report["passed"] else 1
         if args.command == "gate":
             profile = load_gate_profile(args.profile)
             reports = [
@@ -611,7 +647,7 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 for run_path in args.runs
             ]
-            repeated = analyze_repeated_runs(reports, confidence=args.confidence)
+            repeated = analyze_repeated_runs(reports, confidence=args.confidence, scenarios=scenarios)
             if args.format == "json":
                 rendered = json.dumps(repeated, indent=2, ensure_ascii=False)
             elif args.format == "html":
