@@ -232,6 +232,17 @@ agent-eval scenario-version scenarios/ --baseline approved-scenarios.json
 
 Breaking contract changes recommend a major set version and require an increment to the changed scenario's `version`. Additions recommend a minor version; no contract changes recommend a patch. To migrate changed scenario versions and write the recommended set version in one step, use `--migrate` with a baseline. For a legacy/missing manifest, `--write-manifest` writes the current manifest schema. Snapshots contain hashes rather than scenario input contents.
 
+Before merging a scenario edit, inspect which configured release gates it can affect:
+
+```bash
+agent-eval scenario-impact scenarios/ \
+  --baseline approved-scenarios.json \
+  --profile examples/release-gates.yaml \
+  --format text
+```
+
+The report lists added, removed, and changed scenario contracts, identifies changed behavior categories (including an input-change marker), recommends a set version bump, and maps changed scenarios and tags to overall, critical-tag, and critical-scenario gates. Snapshots include only hashes and a concise behavior summary; user input text and tool arguments are not copied. Use `--format json --output impact.json` for CI artifacts. This command reports impact without enforcing a version bump; `scenario-version --baseline` remains the version gate.
+
 For a multi-turn scenario, use `turns` instead of `input`. Top-level `expected` fields check the aggregate conversation and final intent; each turn can add specific assertions:
 
 ```yaml
@@ -393,6 +404,17 @@ agent-eval history trend .agent-eval/history.jsonl \
 `history record` accepts canonical results or a bundle. Bundles are integrity-verified before recording. The append-only JSONL store keeps aggregate metrics, counts, selected execution metadata, and labels; it does not copy scenario inputs or traces. Keep the store with your CI artifacts or durable storage if you need long-term trends.
 
 `history trend` supports exact model, prompt version, and label filters (repeat each flag to match any supplied value), plus inclusive ISO-8601 `--since` and `--until` bounds. Filtering happens before `--limit`, so the limit applies to the latest matching runs. The HTML report is self-contained and escapes stored labels and metadata.
+
+Compare two or more selected runs or releases in one view:
+
+```bash
+agent-eval history compare .agent-eval/history.jsonl \
+  --run-id baseline-run-id --run-id candidate-run-id --format html --output comparison.html
+agent-eval history compare .agent-eval/history.jsonl \
+  --label release-2026-09 --label release-2026-10 --format text
+```
+
+Repeated `--run-id` values select exact runs and set the baseline order. Repeated `--label` values select every matching run in recorded order. The comparison includes pass rate, recorded cost, mean latency, and compact pass/fail outcomes for scenarios marked `severity: critical`; missing measurements or older history records display as unavailable. History still excludes scenario inputs, traces, and agent response text. Use JSON for downstream processing or a standalone HTML comparison for release review.
 
 Generate deterministic coverage-guided candidates for human review:
 

@@ -22,7 +22,9 @@ from agent_eval.drafts import (
 )
 from agent_eval.gate_profiles import GateProfileError, evaluate_release_gates, load_gate_profile, text_release_gate_report
 from agent_eval.graders import GraderError, load_judge_registry
-from agent_eval.history import HistoryError, filter_history, html_trend_report, load_history, record_history, text_trend_report, trend_report
+from agent_eval.history import (HistoryError, compare_history, filter_history, html_history_comparison,
+                                html_trend_report, load_history, record_history, text_history_comparison,
+                                text_trend_report, trend_report)
 from agent_eval.models import AgentResult
 from agent_eval.monitoring import drift_report, experiment_matrix, github_annotation_report, read_variant_spec
 from agent_eval.otel import OpenTelemetryAdapter, load_otel_document
@@ -38,7 +40,9 @@ from agent_eval.runner import RunnerError, execute_scenarios, load_runner
 from agent_eval.scenarios import ScenarioError, filter_scenarios, load_scenarios
 from agent_eval.scoring import evaluate
 from agent_eval.scenario_audit import audit_scenarios, text_scenario_audit
-from agent_eval.versioning import VersioningError, compare_snapshots, migrate_scenario_versions, snapshot as scenario_snapshot, text_version_report, write_manifest
+from agent_eval.versioning import (VersioningError, change_impact_report, compare_snapshots,
+                                   migrate_scenario_versions, snapshot as scenario_snapshot,
+                                   text_version_report, write_manifest)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -143,6 +147,12 @@ def build_parser() -> argparse.ArgumentParser:
     history_trend.add_argument("--label", action="append", help="include runs with this exact label (repeatable)")
     history_trend.add_argument("--since", help="inclusive ISO-8601 date or timestamp")
     history_trend.add_argument("--until", help="inclusive ISO-8601 date or timestamp")
+    history_compare = history_commands.add_parser("compare", help="compare selected runs or releases side by side")
+    history_compare.add_argument("store", type=Path, help="evaluation history JSONL")
+    history_compare.add_argument("--run-id", action="append", help="select an exact run ID (repeatable; order sets baseline)")
+    history_compare.add_argument("--label", action="append", help="select all runs with this exact label (repeatable)")
+    history_compare.add_argument("--format", choices=("text", "json", "html"), default="text")
+    history_compare.add_argument("--output", type=Path)
 
     drafts = commands.add_parser("draft-scenarios", help="create human-review YAML drafts from trace JSONL")
     drafts.add_argument("traces", type=Path, help="raw trace records as JSON Lines")
@@ -244,6 +254,13 @@ def build_parser() -> argparse.ArgumentParser:
     version.add_argument("--output", type=Path)
     version.add_argument("--write-manifest", action="store_true", help="migrate/write scenario-set.yaml")
     version.add_argument("--migrate", action="store_true", help="bump changed scenario versions and write the recommended set version")
+
+    impact = commands.add_parser("scenario-impact", help="report scenario edits and the release gates they can affect")
+    impact.add_argument("scenarios", type=Path)
+    impact.add_argument("--baseline", required=True, type=Path, help="approved scenario-version JSON snapshot")
+    impact.add_argument("--profile", required=True, type=Path, help="release gate profile YAML")
+    impact.add_argument("--format", choices=("text", "json"), default="text")
+    impact.add_argument("--output", type=Path)
 
     calibrate = commands.add_parser("calibrate-judge", help="measure a semantic judge against human-labeled gold examples")
     calibrate.add_argument("gold_set", type=Path, help="YAML gold set")
@@ -441,6 +458,16 @@ def main(argv: list[str] | None = None) -> int:
                     rendered = text_trend_report(report)
                 _write_output(args.output, rendered)
                 return 0
+            if args.history_command == "compare":
+                report = compare_history(load_history(args.store), args.run_id, args.label)
+                if args.format == "json":
+                    rendered = json.dumps(report, indent=2, ensure_ascii=False)
+                elif args.format == "html":
+                    rendered = html_history_comparison(report)
+                else:
+                    rendered = text_history_comparison(report)
+                _write_output(args.output, rendered)
+                return 0
             if args.bundle:
                 verification = verify_bundle(args.bundle)
                 if not verification["valid"]:
@@ -449,16 +476,30 @@ def main(argv: list[str] | None = None) -> int:
                     report_data = json.loads((args.bundle / "report.json").read_text(encoding="utf-8"))
                 except (OSError, json.JSONDecodeError) as exc:
                     raise BundleError(f"could not read bundle report: {exc}") from exc
+                try:
+                    scenario_snapshot_data = json.loads((args.bundle / "scenario-snapshot.json").read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError) as exc:
+                    raise BundleError(f"could not read bundle scenario snapshot: {exc}") from exc
+                score_rows = report_data.get("scenarios", [])
+                critical = {row["id"]: next((score.get("passed") for score in score_rows
+                                             if score.get("scenario") == row["id"]), None)
+                            for row in scenario_snapshot_data.get("scenarios", [])
+                            if (row.get("behavior") or {}).get("severity") == "critical"}
+                critical = {name: passed for name, passed in critical.items() if isinstance(passed, bool)}
                 recorded = record_history(args.store, report_data, label=args.label,
-                                          source_type="bundle", run_id=verification["run_id"])
+                                          source_type="bundle", run_id=verification["run_id"],
+                                          critical_scenarios=critical)
             else:
                 if args.scenarios is None:
                     raise HistoryError("--scenarios is required when recording --responses")
                 history_scenarios = load_scenarios(args.scenarios)
                 history_results = _selected_results(args.responses, history_scenarios, history_scenarios)
                 history_report = evaluate(history_scenarios, history_results, strict=args.strict)
+                score_by_name = {score.scenario: score.passed for score in history_report.scores}
+                critical = {scenario.name: score_by_name[scenario.name] for scenario in history_scenarios
+                            if scenario.severity == "critical" and scenario.name in score_by_name}
                 recorded = record_history(args.store, history_report.as_dict(), label=args.label,
-                                          source_type="results")
+                                          source_type="results", critical_scenarios=critical)
             rendered = json.dumps(recorded, indent=2, ensure_ascii=False) if args.format == "json" else (
                 f"Recorded evaluation {recorded['run_id']} ({recorded['passed']}/{recorded['total']} passed) "
                 f"in {args.store}"
@@ -514,6 +555,33 @@ def main(argv: list[str] | None = None) -> int:
             rendered = json.dumps(payload, indent=2, ensure_ascii=False) if args.format == "json" else text_version_report(current, compatibility)
             _write_output(args.output, rendered)
             return 1 if compatibility and (not compatibility["version_sufficient"] or compatibility["unversioned_changes"]) else 0
+        if args.command == "scenario-impact":
+            scenario_dir = args.scenarios if args.scenarios.is_dir() else args.scenarios.parent
+            try:
+                baseline = json.loads(args.baseline.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise VersioningError(f"could not read baseline snapshot {args.baseline}: {exc}") from exc
+            if not isinstance(baseline, dict) or not isinstance(baseline.get("scenarios"), list):
+                raise VersioningError(f"{args.baseline}: not an Agent Eval scenario snapshot")
+            current = scenario_snapshot(all_scenarios, scenario_dir)
+            compatibility = compare_snapshots(current, baseline)
+            report = change_impact_report(compatibility, load_gate_profile(args.profile))
+            if args.format == "json":
+                rendered = json.dumps(report, indent=2, ensure_ascii=False)
+            else:
+                lines = [f"Scenario change impact: {report['scenario_set']} {report['baseline_version']} → {report['current_version']}",
+                         f"Changes: {len(report['added'])} added, {len(report['removed'])} removed, {len(report['changed'])} changed",
+                         f"Recommended release: {report['recommended_bump']} ({report['recommended_version']})",
+                         f"Affected release gates: {report['affected_gate_count']}", "", "Scenario details:"]
+                for item in report["details"]:
+                    dimensions = ", ".join(item.get("changed_dimensions", []))
+                    lines.append(f"  {item['id']}: {item['change']}" + (f" ({dimensions})" if dimensions else ""))
+                lines.extend(["", "Release gates:"])
+                for gate in report["gates"]:
+                    lines.append(f"  {'AFFECTED' if gate['affected'] else 'unchanged'} {gate['type']} {gate['target']}: {gate['reason']}")
+                rendered = "\n".join(lines)
+            _write_output(args.output, rendered)
+            return 0
         if args.command == "coverage":
             report = scenario_coverage(all_scenarios)
             rendered = json.dumps(report, indent=2, ensure_ascii=False) if args.format == "json" else text_coverage(report)

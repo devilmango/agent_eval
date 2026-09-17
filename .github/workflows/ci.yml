@@ -32,6 +32,7 @@ jobs:
       - name: Check scenario version snapshot, failure analysis, and execution budgets
         run: |
           agent-eval scenario-version scenarios/ --format json --output agent-eval-scenario-version.json
+          agent-eval scenario-impact scenarios/ --baseline agent-eval-scenario-version.json --profile examples/release-gates.yaml --format json --output agent-eval-scenario-impact.json
           agent-eval scenario-audit scenarios/ --max-review-age-days 90 --format json --output agent-eval-scenario-audit.json
           agent-eval triage scenarios/ --responses examples/responses.jsonl --format json --output agent-eval-triage.json
           agent-eval run scenarios/clinic_hours.yaml --responses examples/budget-responses.jsonl --strict --max-cost-usd 0.01 --max-input-tokens 100 --max-output-tokens 50 --max-p95-latency-ms 200 --format json --output agent-eval-budget.json
@@ -45,7 +46,9 @@ jobs:
         run: |
           agent-eval redaction-audit examples/draft-traces.jsonl --config examples/trace-redaction.yaml --strict --format json --output agent-eval-redaction-audit.json
           agent-eval history record --bundle agent-eval-bundle --store agent-eval-history.jsonl --label ci-run
+          agent-eval history record --scenarios scenarios/ --responses examples/responses.jsonl --store agent-eval-history.jsonl --label ci-run
           agent-eval history trend agent-eval-history.jsonl --format json --output agent-eval-history-trend.json
+          agent-eval history compare agent-eval-history.jsonl --label ci-run --format json --output agent-eval-history-comparison.json
           agent-eval history trend agent-eval-history.jsonl --label ci-run --format html --output agent-eval-history.html
           agent-eval draft-scenarios examples/draft-traces.jsonl --mapping examples/draft-mapping.yaml --input-path request.user --redaction-config examples/trace-redaction.yaml --output-dir agent-eval-scenario-drafts
           agent-eval drafts list agent-eval-scenario-drafts --format json --output agent-eval-draft-review.json
@@ -60,6 +63,7 @@ jobs:
             agent-eval-coverage.json
             agent-eval-mutations.json
             agent-eval-scenario-version.json
+            agent-eval-scenario-impact.json
             agent-eval-scenario-audit.json
             agent-eval-triage.json
             agent-eval-budget.json
@@ -68,6 +72,7 @@ jobs:
             agent-eval-gates.json
             agent-eval-history.jsonl
             agent-eval-history-trend.json
+            agent-eval-history-comparison.json
             agent-eval-history.html
             agent-eval-redaction-audit.json
             agent-eval-draft-review.json

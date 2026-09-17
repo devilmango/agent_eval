@@ -13,7 +13,8 @@ from agent_eval.drafts import (
     promote_scenario_draft, review_scenario_draft,
 )
 from agent_eval.scenarios import load_scenario
-from agent_eval.history import HistoryError, filter_history, html_trend_report, load_history, record_history, trend_report
+from agent_eval.history import (HistoryError, compare_history, filter_history, html_history_comparison,
+                                html_trend_report, load_history, record_history, trend_report)
 
 
 class HistoryTests(unittest.TestCase):
@@ -59,6 +60,40 @@ class HistoryTests(unittest.TestCase):
             }) + "\n", encoding="utf-8")
             with self.assertRaises(HistoryError):
                 load_history(store)
+
+    def test_history_comparison_includes_execution_cost_latency_and_critical_scenarios(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = Path(directory) / "history.jsonl"
+            base = {
+                "total": 1, "passed": 1, "failed": 0,
+                "metrics": {"intent_accuracy": 1.0},
+                "execution": {"cost_usd": {"total": .02}, "latency_ms": {"mean": 120}},
+            }
+            record_history(store, base, label="release-a", source_type="results", run_id="a",
+                           critical_scenarios={"safety": True})
+            record_history(store, {**base, "passed": 0, "failed": 1,
+                                   "execution": {"cost_usd": {"total": .03}, "latency_ms": {"mean": 150}}},
+                           label="release-b", source_type="results", run_id="b",
+                           critical_scenarios={"safety": False})
+            report = compare_history(load_history(store), ["a", "b"])
+        self.assertAlmostEqual(report["deltas_vs_baseline"]["cost_usd"]["b"], .01)
+        self.assertEqual(report["deltas_vs_baseline"]["latency_ms"]["b"], 30)
+        self.assertEqual(report["critical_scenarios"], ["safety"])
+        self.assertIn("Critical: safety", html_history_comparison(report))
+
+    def test_history_compare_cli_writes_side_by_side_html(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = root / "history.jsonl"
+            base = {"total": 1, "passed": 1, "failed": 0, "metrics": {"intent_accuracy": 1.0}}
+            record_history(store, base, label="same", source_type="results", run_id="one")
+            record_history(store, base, label="same", source_type="results", run_id="two")
+            output = root / "compare.html"
+            with redirect_stdout(StringIO()):
+                status = main(["history", "compare", str(store), "--label", "same",
+                               "--format", "html", "--output", str(output)])
+            self.assertEqual(status, 0)
+            self.assertIn("Evaluation run comparison", output.read_text(encoding="utf-8"))
 
     def test_history_filters_by_model_prompt_label_and_date_and_renders_html(self):
         base = {

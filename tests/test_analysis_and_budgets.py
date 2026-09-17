@@ -11,7 +11,7 @@ from agent_eval.models import AgentResult, Scenario
 from agent_eval.quality import failure_analysis
 from agent_eval.scenarios import load_scenarios
 from agent_eval.scoring import evaluate
-from agent_eval.versioning import compare_snapshots, migrate_scenario_versions, snapshot, write_manifest
+from agent_eval.versioning import change_impact_report, compare_snapshots, migrate_scenario_versions, snapshot, write_manifest
 
 
 class AnalysisAndBudgetTests(unittest.TestCase):
@@ -59,6 +59,7 @@ class AnalysisAndBudgetTests(unittest.TestCase):
             current = snapshot(load_scenarios(root), root)
             diff = compare_snapshots(current, baseline)
             self.assertEqual(diff["recommended_bump"], "major")
+            self.assertIn("intent", diff["details"][0]["changed_dimensions"])
             self.assertFalse(diff["version_sufficient"])
             self.assertEqual(migrate_scenario_versions(load_scenarios(root), baseline), ["greet"])
             migrated = load_scenarios(root)
@@ -67,6 +68,24 @@ class AnalysisAndBudgetTests(unittest.TestCase):
             self.assertEqual(final_diff["unversioned_changes"], [])
             self.assertTrue(final_diff["version_sufficient"])
             self.assertEqual(migrated[0].version, 2)
+
+    def test_impact_report_maps_changes_to_overall_and_critical_gates(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "scenario.yaml"
+            source.write_text("scenario: greet\ninput: {user: hi}\nexpected: {intent: GREET}\ntags: [safety]\nseverity: critical\n", encoding="utf-8")
+            old = snapshot(load_scenarios(root), root)
+            self.assertEqual(compare_snapshots(old, json.loads(json.dumps(old)))["changed"], [])
+            source.write_text("scenario: greet\ninput: {user: hello}\nexpected: {intent: GREET}\ntags: [safety]\nseverity: critical\n", encoding="utf-8")
+            current = snapshot(load_scenarios(root), root)
+            compatibility = compare_snapshots(current, old)
+            impact = change_impact_report(compatibility, {
+                "min_overall_pass_rate": .9, "critical_tags": {"safety": 1.0},
+                "critical_scenarios": {"greet": 1.0},
+            })
+        self.assertIn("input", impact["details"][0]["changed_dimensions"])
+        self.assertEqual(impact["affected_gate_count"], 3)
+        self.assertTrue(all(gate["affected"] for gate in impact["gates"]))
 
     def test_cli_scenario_migration_and_triage(self):
         with tempfile.TemporaryDirectory() as directory:

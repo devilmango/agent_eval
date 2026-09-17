@@ -55,6 +55,7 @@ def record_history(
     label: str | None = None,
     source_type: str,
     run_id: str | None = None,
+    critical_scenarios: dict[str, bool] | None = None,
 ) -> dict[str, Any]:
     """Append a compact report summary without storing scenarios or trace contents."""
     metrics = report.get("metrics")
@@ -85,6 +86,7 @@ def record_history(
         },
         "models": execution.get("models", []),
         "prompt_versions": execution.get("prompt_versions", []),
+        "critical_scenarios": dict(sorted((critical_scenarios or {}).items())),
     }
     _validate_record(record, str(path))
     try:
@@ -98,6 +100,122 @@ def record_history(
     except OSError as exc:
         raise HistoryError(f"could not append history {path}: {exc}") from exc
     return record
+
+
+def compare_history(records: list[dict[str, Any]], run_ids: list[str] | None = None,
+                    labels: list[str] | None = None) -> dict[str, Any]:
+    """Compare selected runs in their supplied order (IDs) or history order (labels)."""
+    if not run_ids and not labels:
+        raise HistoryError("history compare requires at least two --run-id or --label selections")
+    by_id = {record["run_id"]: record for record in records}
+    selected: list[dict[str, Any]] = []
+    for run_id in run_ids or []:
+        if run_id not in by_id:
+            raise HistoryError(f"history run ID not found: {run_id}")
+        selected.append(by_id[run_id])
+    if labels:
+        selected.extend(record for record in records if record.get("label") in labels)
+    unique = {record["run_id"]: record for record in selected}
+    if len(unique) < 2:
+        raise HistoryError("history compare needs at least two distinct matching runs")
+    # Explicit run IDs define their order; label selection uses chronological order.
+    ordered_ids = []
+    for run_id in run_ids or []:
+        if run_id in unique and run_id not in ordered_ids:
+            ordered_ids.append(run_id)
+    ordered_ids.extend(record["run_id"] for record in records
+                       if record["run_id"] in unique and record["run_id"] not in ordered_ids)
+    runs = [unique[run_id] for run_id in ordered_ids]
+    baseline = runs[0]
+    dimensions = ["pass_rate", "cost_usd", "latency_ms"]
+    deltas = {}
+    for key in dimensions:
+        before = _history_value(baseline, key)
+        deltas[key] = {record["run_id"]: _subtract(before, _history_value(record, key)) for record in runs[1:]}
+    return {"run_count": len(runs), "baseline": baseline, "runs": runs,
+            "deltas_vs_baseline": deltas,
+            "critical_scenarios": sorted({name for run in runs for name in run.get("critical_scenarios", {})})}
+
+
+def _history_value(record: dict[str, Any], key: str) -> float | None:
+    if key == "pass_rate":
+        value = record.get("pass_rate")
+    else:
+        execution = record.get("execution", {})
+        value = execution.get(key) if isinstance(execution, dict) else None
+        if isinstance(value, dict):
+            value = value.get("total") if key == "cost_usd" else value.get("mean")
+    return value if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+
+def _subtract(before: float | None, after: float | None) -> float | None:
+    return None if before is None or after is None else after - before
+
+
+def text_history_comparison(report: dict[str, Any]) -> str:
+    lines = [f"Evaluation comparison: {report['run_count']} runs",
+             f"Baseline: {_run_label(report['baseline'])}", "",
+             "Run                              Pass rate     Cost (USD)   Mean latency (ms)"]
+    for run in report["runs"]:
+        execution = run.get("execution", {})
+        cost = _history_value(run, "cost_usd")
+        latency = _history_value(run, "latency_ms")
+        lines.append(f"{_run_label(run):32.32} "
+                     f"{format_rate(run.get('pass_rate')):12} "
+                     f"{cost if cost is not None else 'n/a':>12} "
+                     f"{latency if latency is not None else 'n/a':>18}")
+    lines.extend(["", "Change vs baseline:"])
+    for key, title in (("pass_rate", "Pass rate"), ("cost_usd", "Cost (USD)"), ("latency_ms", "Mean latency (ms)")):
+        for run in report["runs"][1:]:
+            delta = report["deltas_vs_baseline"][key][run["run_id"]]
+            rendered_delta = "n/a" if delta is None else f"{delta * 100:+.1f} pp" if key == "pass_rate" else f"{delta:+.4g}"
+            lines.append(f"  {title} · {_run_label(run)}: {rendered_delta}")
+    lines.extend(["", "Critical scenarios:"])
+    for name in report["critical_scenarios"]:
+        statuses = ["pass" if run.get("critical_scenarios", {}).get(name) is True else
+                    "fail" if run.get("critical_scenarios", {}).get(name) is False else "n/a"
+                    for run in report["runs"]]
+        lines.append(f"  {name}: " + " | ".join(statuses))
+    return "\n".join(lines)
+
+
+def html_history_comparison(report: dict[str, Any]) -> str:
+    headers = "".join(f"<th scope=\"col\">{escape(_run_label(run))}</th>"
+                      for run in report["runs"])
+    rows = []
+    metrics = [("Pass rate", lambda run: format_rate(run.get("pass_rate"))),
+               ("Cost (USD)", lambda run: _display(_history_value(run, "cost_usd"))),
+               ("Mean latency (ms)", lambda run: _display(_history_value(run, "latency_ms")))]
+    for title, value in metrics:
+        rows.append("<tr><th scope=\"row\">" + escape(title) + "</th>" +
+                    "".join("<td>" + escape(str(value(run))) + "</td>" for run in report["runs"]) + "</tr>")
+    for key, title in (("pass_rate", "Pass rate Δ"), ("cost_usd", "Cost Δ"), ("latency_ms", "Mean latency Δ")):
+        cells = ["<td>baseline</td>"]
+        for run in report["runs"][1:]:
+            delta = report["deltas_vs_baseline"][key][run["run_id"]]
+            rendered_delta = "n/a" if delta is None else f"{delta * 100:+.1f} pp" if key == "pass_rate" else f"{delta:+.4g}"
+            cells.append("<td>" + escape(rendered_delta) + "</td>")
+        rows.append("<tr><th scope=\"row\">" + escape(title) + "</th>" + "".join(cells) + "</tr>")
+    for name in report["critical_scenarios"]:
+        statuses = ["pass" if run.get("critical_scenarios", {}).get(name) is True else
+                    "fail" if run.get("critical_scenarios", {}).get(name) is False else "n/a"
+                    for run in report["runs"]]
+        rows.append("<tr><th scope=\"row\">Critical: " + escape(name) + "</th>" +
+                    "".join("<td>" + status + "</td>" for status in statuses) + "</tr>")
+    return ("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>Agent Eval run comparison</title>"
+            "<style>body{font:16px/1.5 system-ui,sans-serif;margin:2rem auto;padding:0 1rem;max-width:1100px;color:#17202a}"
+            "table{border-collapse:collapse;width:100%}th,td{text-align:left;padding:.6rem;border-bottom:1px solid #d8dee4}"
+            "thead{background:#f3f6f8}</style></head><body><h1>Evaluation run comparison</h1><table><thead><tr><th>Measure</th>"
+            + headers + "</tr></thead><tbody>" + "".join(rows) + "</tbody></table></body></html>")
+
+
+def _display(value: float | None) -> str:
+    return "n/a" if value is None else f"{value:.4g}"
+
+
+def _run_label(record: dict[str, Any]) -> str:
+    label = str(record.get("label") or "run")
+    return f"{label} [{record['run_id'][:8]}]"
 
 
 def trend_report(records: list[dict[str, Any]], *, limit: int | None = None) -> dict[str, Any]:
