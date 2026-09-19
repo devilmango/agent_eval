@@ -23,10 +23,11 @@ from agent_eval.drafts import (
 from agent_eval.gate_profiles import GateProfileError, evaluate_release_gates, load_gate_profile, text_release_gate_report
 from agent_eval.graders import GraderError, load_judge_registry
 from agent_eval.history import (HistoryError, compare_history, filter_history, html_history_comparison,
-                                html_trend_report, load_history, record_history, text_history_comparison,
-                                text_trend_report, trend_report)
+                                html_trend_report, load_history, merge_history, record_history,
+                                text_history_comparison, text_trend_report, trend_report)
 from agent_eval.models import AgentResult
-from agent_eval.monitoring import drift_report, experiment_matrix, github_annotation_report, read_variant_spec
+from agent_eval.monitoring import (drift_report, experiment_matrix, github_annotation_report,
+                                   github_scenario_impact_report, read_variant_spec)
 from agent_eval.otel import OpenTelemetryAdapter, load_otel_document
 from agent_eval.quality import failure_analysis, mutation_report, scenario_coverage, scenario_suggestions, judge_agreement, text_coverage, text_mutation_report, text_failure_analysis
 from agent_eval.report import html_report, json_report, repeated_html_report, text_report
@@ -153,6 +154,10 @@ def build_parser() -> argparse.ArgumentParser:
     history_compare.add_argument("--label", action="append", help="select all runs with this exact label (repeatable)")
     history_compare.add_argument("--format", choices=("text", "json", "html"), default="text")
     history_compare.add_argument("--output", type=Path)
+    history_merge = history_commands.add_parser("merge", help="merge history stores and deduplicate identical run IDs")
+    history_merge.add_argument("stores", nargs="+", type=Path, help="input history JSONL stores")
+    history_merge.add_argument("--output", required=True, type=Path, help="new merged history JSONL path")
+    history_merge.add_argument("--format", choices=("text", "json"), default="text")
 
     drafts = commands.add_parser("draft-scenarios", help="create human-review YAML drafts from trace JSONL")
     drafts.add_argument("traces", type=Path, help="raw trace records as JSON Lines")
@@ -261,6 +266,8 @@ def build_parser() -> argparse.ArgumentParser:
     impact.add_argument("--profile", required=True, type=Path, help="release gate profile YAML")
     impact.add_argument("--format", choices=("text", "json"), default="text")
     impact.add_argument("--output", type=Path)
+    impact.add_argument("--github-annotations", action="store_true", help="emit GitHub Actions annotations and step summary")
+    impact.add_argument("--summary-file", type=Path, help="append a Markdown summary (defaults to GITHUB_STEP_SUMMARY when set)")
 
     calibrate = commands.add_parser("calibrate-judge", help="measure a semantic judge against human-labeled gold examples")
     calibrate.add_argument("gold_set", type=Path, help="YAML gold set")
@@ -468,6 +475,16 @@ def main(argv: list[str] | None = None) -> int:
                     rendered = text_history_comparison(report)
                 _write_output(args.output, rendered)
                 return 0
+            if args.history_command == "merge":
+                report = merge_history(args.stores, args.output)
+                if args.format == "json":
+                    rendered = json.dumps({key: value for key, value in report.items() if key != "records"},
+                                          indent=2, ensure_ascii=False)
+                else:
+                    rendered = (f"Merged {report['record_count']} unique runs from {report['input_count']} stores; "
+                                f"removed {report['duplicate_count']} duplicate run ID(s) into {args.output}")
+                print(rendered)
+                return 0
             if args.bundle:
                 verification = verify_bundle(args.bundle)
                 if not verification["valid"]:
@@ -481,14 +498,21 @@ def main(argv: list[str] | None = None) -> int:
                 except (OSError, json.JSONDecodeError) as exc:
                     raise BundleError(f"could not read bundle scenario snapshot: {exc}") from exc
                 score_rows = report_data.get("scenarios", [])
+                scenario_rows = scenario_snapshot_data.get("scenarios", [])
+                if (not isinstance(score_rows, list) or not all(isinstance(score, dict) for score in score_rows)
+                        or not isinstance(scenario_rows, list) or not all(isinstance(row, dict) for row in scenario_rows)):
+                    raise BundleError("bundle report or scenario snapshot has malformed scenario rows")
                 critical = {row["id"]: next((score.get("passed") for score in score_rows
                                              if score.get("scenario") == row["id"]), None)
-                            for row in scenario_snapshot_data.get("scenarios", [])
-                            if (row.get("behavior") or {}).get("severity") == "critical"}
+                            for row in scenario_rows if isinstance(row.get("id"), str)
+                            if isinstance(row.get("behavior"), dict)
+                            and row["behavior"].get("severity") == "critical"}
                 critical = {name: passed for name, passed in critical.items() if isinstance(passed, bool)}
+                scenario_results = {score["scenario"]: score["passed"] for score in score_rows
+                                    if isinstance(score.get("scenario"), str) and isinstance(score.get("passed"), bool)}
                 recorded = record_history(args.store, report_data, label=args.label,
                                           source_type="bundle", run_id=verification["run_id"],
-                                          critical_scenarios=critical)
+                                          critical_scenarios=critical, scenario_results=scenario_results)
             else:
                 if args.scenarios is None:
                     raise HistoryError("--scenarios is required when recording --responses")
@@ -499,7 +523,8 @@ def main(argv: list[str] | None = None) -> int:
                 critical = {scenario.name: score_by_name[scenario.name] for scenario in history_scenarios
                             if scenario.severity == "critical" and scenario.name in score_by_name}
                 recorded = record_history(args.store, history_report.as_dict(), label=args.label,
-                                          source_type="results", critical_scenarios=critical)
+                                          source_type="results", critical_scenarios=critical,
+                                          scenario_results=score_by_name)
             rendered = json.dumps(recorded, indent=2, ensure_ascii=False) if args.format == "json" else (
                 f"Recorded evaluation {recorded['run_id']} ({recorded['passed']}/{recorded['total']} passed) "
                 f"in {args.store}"
@@ -581,6 +606,19 @@ def main(argv: list[str] | None = None) -> int:
                     lines.append(f"  {'AFFECTED' if gate['affected'] else 'unchanged'} {gate['type']} {gate['target']}: {gate['reason']}")
                 rendered = "\n".join(lines)
             _write_output(args.output, rendered)
+            if args.github_annotations or args.summary_file:
+                annotations, summary = github_scenario_impact_report(report)
+                if args.github_annotations and annotations:
+                    print(annotations)
+                summary_path = args.summary_file or (
+                    Path(os.environ["GITHUB_STEP_SUMMARY"])
+                    if args.github_annotations and os.environ.get("GITHUB_STEP_SUMMARY") else None
+                )
+                if summary_path:
+                    with summary_path.open("a", encoding="utf-8") as handle:
+                        handle.write(summary)
+                elif args.github_annotations:
+                    print(summary)
             return 0
         if args.command == "coverage":
             report = scenario_coverage(all_scenarios)

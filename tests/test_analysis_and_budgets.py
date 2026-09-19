@@ -87,6 +87,36 @@ class AnalysisAndBudgetTests(unittest.TestCase):
         self.assertEqual(impact["affected_gate_count"], 3)
         self.assertTrue(all(gate["affected"] for gate in impact["gates"]))
 
+    def test_cli_scenario_impact_emits_github_annotations_and_summary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            scenarios = root / "scenarios"
+            scenarios.mkdir()
+            (scenarios / "scenario.yaml").write_text(
+                "scenario: safety_check\ninput: {user: hi}\nexpected: {intent: HELP}\n"
+                "tags: [safety]\nseverity: critical\n", encoding="utf-8")
+            (root / "profile.yaml").write_text(
+                "min_overall_pass_rate: 0.9\ncritical_tags:\n  safety: 1.0\n"
+                "critical_scenarios:\n  safety_check: 1.0\n", encoding="utf-8")
+            baseline = root / "baseline.json"
+            summary = root / "summary.md"
+            with redirect_stdout(StringIO()):
+                self.assertEqual(main(["scenario-version", str(scenarios), "--format", "json",
+                                       "--output", str(baseline)]), 0)
+            (scenarios / "scenario.yaml").write_text(
+                "scenario: safety_check\ninput: {user: hi}\nexpected: {intent: BOOK}\n"
+                "tags: [safety]\nseverity: critical\n", encoding="utf-8")
+            output = StringIO()
+            with redirect_stdout(output):
+                status = main(["scenario-impact", str(scenarios), "--baseline", str(baseline),
+                               "--profile", str(root / "profile.yaml"), "--github-annotations",
+                               "--summary-file", str(summary)])
+            summary_content = summary.read_text(encoding="utf-8")
+        self.assertEqual(status, 0)
+        self.assertIn("::warning title=Scenario impact%3A safety_check::", output.getvalue())
+        self.assertIn("AFFECTED overall_pass_rate", output.getvalue())
+        self.assertIn("Agent Eval scenario change impact", summary_content)
+
     def test_cli_scenario_migration_and_triage(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

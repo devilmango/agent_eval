@@ -72,12 +72,65 @@ def github_annotation_report(
     return "\n".join(annotations), "\n".join(rows) + "\n"
 
 
+def github_scenario_impact_report(report: dict[str, Any]) -> tuple[str, str]:
+    """Render scenario change impact as GitHub workflow annotations and Markdown."""
+    annotations = []
+    changed_names = {item["id"] for item in report.get("details", [])}
+    for item in report.get("details", []):
+        name = item["id"]
+        dimensions = item.get("changed_dimensions", [])
+        reason = item.get("change", "changed")
+        if dimensions:
+            reason += " behavior: " + ", ".join(dimensions)
+        matching_gates = [gate["target"] for gate in report.get("gates", [])
+                          if gate.get("affected") and (
+                              gate.get("type") == "overall_pass_rate"
+                              or name in gate.get("scenarios", [])
+                              or (gate.get("type") == "critical_scenario_pass_rate" and gate.get("target") == name)
+                          )]
+        if matching_gates:
+            reason += "; may affect release gates: " + ", ".join(matching_gates)
+        level = "warning" if matching_gates else "notice"
+        annotations.append(_workflow_command(level, f"Scenario impact: {name}", reason))
+
+    lines = ["## Agent Eval scenario change impact", "",
+             f"Scenario set: **{_markdown_cell(str(report['scenario_set']))}** "
+             f"({report['baseline_version']} → {report['current_version']})",
+             f"Changes: **{len(report['added'])} added**, **{len(report['removed'])} removed**, **{len(report['changed'])} changed**; "
+             f"affected release gates: **{report['affected_gate_count']}**.",
+             f"Recommended version: **{report['recommended_version']}** ({report['recommended_bump']}).", ""]
+    if changed_names:
+        lines.extend(["| Scenario | Change | Behavior dimensions |", "| --- | --- | --- |"])
+        for item in report["details"]:
+            dimensions = ", ".join(item.get("changed_dimensions", [])) or "—"
+            lines.append(f"| {_markdown_cell(item['id'])} | {_markdown_cell(item['change'])} | {_markdown_cell(dimensions)} |")
+    else:
+        lines.append("No scenario contracts changed.")
+    gates = report.get("gates", [])
+    lines.extend(["", "### Release gates", ""])
+    if gates:
+        lines.extend(["| Gate | Status | Minimum | Scenarios |", "| --- | --- | ---: | --- |"])
+        for gate in gates:
+            names = ", ".join(gate.get("scenarios", [])) or gate["target"]
+            status = "affected" if gate.get("affected") else "unchanged"
+            lines.append(f"| {_markdown_cell(str(gate['type']) + ': ' + str(gate['target']))} | {status} | "
+                         f"{_markdown_cell(str(gate.get('minimum', '—')))} | {_markdown_cell(names)} |")
+    else:
+        lines.append("No release gates are configured.")
+    return "\n".join(annotations), "\n".join(lines) + "\n"
+
+
 def _workflow_command(level: str, title: str, message: str) -> str:
     def escape_data(value: str) -> str:
         return value.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
 
     escaped_title = escape_data(title).replace(":", "%3A").replace(",", "%2C")
     return f"::{level} title={escaped_title}::{escape_data(message)}"
+
+
+def _markdown_cell(value: str) -> str:
+    return (value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            .replace("|", "\\|").replace("\r", " ").replace("\n", " "))
 
 
 def drift_report(

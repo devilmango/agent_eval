@@ -6,7 +6,9 @@ from datetime import datetime, timezone
 import json
 from html import escape
 from math import isfinite
+import os
 from pathlib import Path
+import tempfile
 from typing import Any
 from uuid import uuid4
 
@@ -28,6 +30,11 @@ def _validate_record(record: Any, source: str) -> dict[str, Any]:
         not isinstance(value, (int, float)) or isinstance(value, bool) or not isfinite(value)
     ) for value in record["metrics"].values()):
         raise HistoryError(f"{source}: metric values must be numbers or null")
+    for key in ("critical_scenarios", "scenario_results"):
+        values = record.get(key, {})
+        if not isinstance(values, dict) or any(not isinstance(name, str) or not isinstance(passed, bool)
+                                               for name, passed in values.items()):
+            raise HistoryError(f"{source}: {key} must map scenario IDs to boolean outcomes")
     return record
 
 
@@ -56,6 +63,7 @@ def record_history(
     source_type: str,
     run_id: str | None = None,
     critical_scenarios: dict[str, bool] | None = None,
+    scenario_results: dict[str, bool] | None = None,
 ) -> dict[str, Any]:
     """Append a compact report summary without storing scenarios or trace contents."""
     metrics = report.get("metrics")
@@ -87,6 +95,7 @@ def record_history(
         "models": execution.get("models", []),
         "prompt_versions": execution.get("prompt_versions", []),
         "critical_scenarios": dict(sorted((critical_scenarios or {}).items())),
+        "scenario_results": dict(sorted((scenario_results or {}).items())),
     }
     _validate_record(record, str(path))
     try:
@@ -100,6 +109,52 @@ def record_history(
     except OSError as exc:
         raise HistoryError(f"could not append history {path}: {exc}") from exc
     return record
+
+
+def merge_history(input_paths: list[Path], output_path: Path) -> dict[str, Any]:
+    """Merge history stores by run ID, rejecting duplicate IDs with conflicting results."""
+    if not input_paths:
+        raise HistoryError("history merge requires at least one input store")
+    output_resolved = output_path.resolve()
+    if any(path.resolve() == output_resolved for path in input_paths):
+        raise HistoryError("history merge output must differ from every input store")
+    unique: dict[str, dict[str, Any]] = {}
+    duplicate_count = 0
+    for path in input_paths:
+        for record in load_history(path):
+            run_id = record["run_id"]
+            existing = unique.get(run_id)
+            if existing is None:
+                unique[run_id] = record
+                continue
+            duplicate_count += 1
+            if _run_identity(existing) != _run_identity(record):
+                raise HistoryError(f"conflicting history records share run ID {run_id}")
+            if record["recorded_at"] > existing["recorded_at"]:
+                unique[run_id] = record
+    records = sorted(unique.values(), key=lambda item: (item["recorded_at"], item["run_id"]))
+    try:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary_name = tempfile.mkstemp(prefix=f".{output_path.name}.", suffix=".tmp",
+                                                      dir=output_path.parent)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                for record in records:
+                    stream.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+            os.replace(temporary_name, output_path)
+        except Exception:
+            Path(temporary_name).unlink(missing_ok=True)
+            raise
+    except OSError as exc:
+        raise HistoryError(f"could not write merged history {output_path}: {exc}") from exc
+    return {"input_count": len(input_paths), "record_count": len(records),
+            "duplicate_count": duplicate_count, "records": records}
+
+
+def _run_identity(record: dict[str, Any]) -> str:
+    fields = ("total", "passed", "failed", "pass_rate", "metrics", "execution", "models",
+              "prompt_versions", "critical_scenarios", "scenario_results")
+    return json.dumps({field: record.get(field) for field in fields}, sort_keys=True, separators=(",", ":"))
 
 
 def compare_history(records: list[dict[str, Any]], run_ids: list[str] | None = None,
@@ -132,9 +187,19 @@ def compare_history(records: list[dict[str, Any]], run_ids: list[str] | None = N
     for key in dimensions:
         before = _history_value(baseline, key)
         deltas[key] = {record["run_id"]: _subtract(before, _history_value(record, key)) for record in runs[1:]}
+    scenario_names = sorted({name for run in runs for name in run.get("scenario_results", {})})
+    scenario_comparisons = []
+    for name in scenario_names:
+        outcomes = {run["run_id"]: run.get("scenario_results", {}).get(name) for run in runs}
+        regressions = [run["run_id"] for run in runs[1:]
+                       if outcomes[baseline["run_id"]] is True and outcomes[run["run_id"]] is False]
+        scenario_comparisons.append({"scenario": name, "outcomes": outcomes, "regressed_in": regressions,
+                                     "critical": name in {critical for run in runs
+                                                          for critical in run.get("critical_scenarios", {})}})
     return {"run_count": len(runs), "baseline": baseline, "runs": runs,
             "deltas_vs_baseline": deltas,
-            "critical_scenarios": sorted({name for run in runs for name in run.get("critical_scenarios", {})})}
+            "critical_scenarios": sorted({name for run in runs for name in run.get("critical_scenarios", {})}),
+            "scenario_comparisons": scenario_comparisons}
 
 
 def _history_value(record: dict[str, Any], key: str) -> float | None:
@@ -176,6 +241,14 @@ def text_history_comparison(report: dict[str, Any]) -> str:
                     "fail" if run.get("critical_scenarios", {}).get(name) is False else "n/a"
                     for run in report["runs"]]
         lines.append(f"  {name}: " + " | ".join(statuses))
+    lines.extend(["", "Scenario outcomes:"])
+    for item in report["scenario_comparisons"]:
+        statuses = ["pass" if item["outcomes"].get(run["run_id"]) is True else
+                    "fail" if item["outcomes"].get(run["run_id"]) is False else "n/a"
+                    for run in report["runs"]]
+        marker = " [critical]" if item["critical"] else ""
+        regression = "  REGRESSION" if item["regressed_in"] else ""
+        lines.append(f"  {item['scenario']}{marker}: " + " | ".join(statuses) + regression)
     return "\n".join(lines)
 
 
@@ -202,6 +275,17 @@ def html_history_comparison(report: dict[str, Any]) -> str:
                     for run in report["runs"]]
         rows.append("<tr><th scope=\"row\">Critical: " + escape(name) + "</th>" +
                     "".join("<td>" + status + "</td>" for status in statuses) + "</tr>")
+    for item in report["scenario_comparisons"]:
+        cells = []
+        for run in report["runs"]:
+            outcome = item["outcomes"].get(run["run_id"])
+            status = "pass" if outcome is True else "fail" if outcome is False else "n/a"
+            if run["run_id"] in item["regressed_in"]:
+                status += " · regression"
+            cells.append("<td>" + escape(status) + "</td>")
+        marker = " (critical)" if item["critical"] else ""
+        rows.append("<tr><th scope=\"row\">Scenario: " + escape(item["scenario"] + marker) + "</th>" +
+                    "".join(cells) + "</tr>")
     return ("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>Agent Eval run comparison</title>"
             "<style>body{font:16px/1.5 system-ui,sans-serif;margin:2rem auto;padding:0 1rem;max-width:1100px;color:#17202a}"
             "table{border-collapse:collapse;width:100%}th,td{text-align:left;padding:.6rem;border-bottom:1px solid #d8dee4}"

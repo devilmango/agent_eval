@@ -14,7 +14,7 @@ from agent_eval.drafts import (
 )
 from agent_eval.scenarios import load_scenario
 from agent_eval.history import (HistoryError, compare_history, filter_history, html_history_comparison,
-                                html_trend_report, load_history, record_history, trend_report)
+                                html_trend_report, load_history, merge_history, record_history, trend_report)
 
 
 class HistoryTests(unittest.TestCase):
@@ -70,16 +70,49 @@ class HistoryTests(unittest.TestCase):
                 "execution": {"cost_usd": {"total": .02}, "latency_ms": {"mean": 120}},
             }
             record_history(store, base, label="release-a", source_type="results", run_id="a",
-                           critical_scenarios={"safety": True})
+                           critical_scenarios={"safety": True}, scenario_results={"safety": True, "booking": True})
             record_history(store, {**base, "passed": 0, "failed": 1,
                                    "execution": {"cost_usd": {"total": .03}, "latency_ms": {"mean": 150}}},
                            label="release-b", source_type="results", run_id="b",
-                           critical_scenarios={"safety": False})
+                           critical_scenarios={"safety": False}, scenario_results={"safety": False, "booking": True})
             report = compare_history(load_history(store), ["a", "b"])
         self.assertAlmostEqual(report["deltas_vs_baseline"]["cost_usd"]["b"], .01)
         self.assertEqual(report["deltas_vs_baseline"]["latency_ms"]["b"], 30)
         self.assertEqual(report["critical_scenarios"], ["safety"])
         self.assertIn("Critical: safety", html_history_comparison(report))
+        safety = next(item for item in report["scenario_comparisons"] if item["scenario"] == "safety")
+        self.assertEqual(safety["regressed_in"], ["b"])
+        self.assertTrue(safety["critical"])
+        self.assertIn("regression", html_history_comparison(report))
+
+    def test_history_merge_deduplicates_runs_and_rejects_conflicts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first, second, merged = root / "first.jsonl", root / "second.jsonl", root / "merged.jsonl"
+            report = {"total": 1, "passed": 1, "failed": 0, "metrics": {"intent_accuracy": 1.0}}
+            record_history(first, report, source_type="results", run_id="same")
+            first_record = load_history(first)[0]
+            second.write_text(json.dumps(first_record) + "\n", encoding="utf-8")
+            result = merge_history([first, second], merged)
+            self.assertEqual((result["record_count"], result["duplicate_count"]), (1, 1))
+            conflict = {**first_record, "passed": 0, "failed": 1, "pass_rate": 0.0}
+            second.write_text(json.dumps(conflict) + "\n", encoding="utf-8")
+            with self.assertRaisesRegex(HistoryError, "conflicting history records"):
+                merge_history([first, second], root / "conflict.jsonl")
+
+    def test_history_merge_cli_reports_deduplication(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first, second, output = root / "one.jsonl", root / "two.jsonl", root / "merged.jsonl"
+            report = {"total": 1, "passed": 1, "failed": 0, "metrics": {}}
+            record_history(first, report, source_type="results", run_id="run-1")
+            second.write_text(first.read_text(encoding="utf-8"), encoding="utf-8")
+            stdout = StringIO()
+            with redirect_stdout(stdout):
+                status = main(["history", "merge", "--output", str(output), str(first), str(second)])
+            self.assertEqual(status, 0)
+            self.assertIn("removed 1 duplicate", stdout.getvalue())
+            self.assertEqual(len(load_history(output)), 1)
 
     def test_history_compare_cli_writes_side_by_side_html(self):
         with tempfile.TemporaryDirectory() as directory:
