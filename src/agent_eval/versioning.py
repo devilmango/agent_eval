@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
+import os
 import re
 from pathlib import Path
+import tempfile
 from typing import Any
+from datetime import datetime, timezone
 
 import yaml
 
@@ -177,6 +179,70 @@ def compare_snapshots(current: dict[str, Any], baseline: dict[str, Any]) -> dict
         "recommended_version": _next_version(old_version, bump),
         "version_sufficient": sufficient and not unversioned_changes,
     }
+
+
+def scenario_baseline_review(current: dict[str, Any], baseline: dict[str, Any] | None) -> dict[str, Any]:
+    """Return a review report and decide whether the current snapshot can be approved."""
+    if baseline is None:
+        return {
+            "scenario_set": current["scenario_set"],
+            "baseline_exists": False,
+            "baseline_version": None,
+            "current_version": current["version"],
+            "added": [row["id"] for row in current["scenarios"]],
+            "removed": [], "changed": [], "details": [
+                {"id": row["id"], "change": "initial scenario", "behavior": row.get("behavior")}
+                for row in current["scenarios"]
+            ],
+            "recommended_bump": None,
+            "recommended_version": current["version"],
+            "unversioned_changes": [],
+            "version_sufficient": True,
+            "approval_ready": True,
+            "approval_blockers": [],
+        }
+
+    compatibility = compare_snapshots(current, baseline)
+    changed = bool(compatibility["added"] or compatibility["removed"] or compatibility["changed"])
+    blockers = []
+    if changed and not compatibility["version_sufficient"]:
+        if compatibility["unversioned_changes"]:
+            blockers.append("changed scenarios need a per-scenario version increment")
+        if not compatibility["version_sufficient"] and not compatibility["unversioned_changes"]:
+            blockers.append("scenario-set version does not satisfy the recommended bump")
+    if not changed and tuple(current["version_tuple"]) < tuple(baseline.get("version_tuple", ())):
+        blockers.append("scenario-set version cannot move backwards")
+    return {
+        **compatibility,
+        "baseline_exists": True,
+        "approval_ready": not blockers,
+        "approval_blockers": blockers,
+    }
+
+
+def write_approved_scenario_baseline(
+    path: Path, current: dict[str, Any], *, approved_by: str | None = None,
+) -> dict[str, Any]:
+    """Atomically replace the approved snapshot after an explicit review approval."""
+    approved = dict(current)
+    approval = {"approved_at": datetime.now(timezone.utc).isoformat()}
+    if approved_by:
+        approval["approved_by"] = approved_by
+    approved["approval"] = approval
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                json.dump(approved, stream, ensure_ascii=False, indent=2)
+                stream.write("\n")
+            os.replace(temporary_name, path)
+        except Exception:
+            Path(temporary_name).unlink(missing_ok=True)
+            raise
+    except OSError as exc:
+        raise VersioningError(f"could not write approved scenario baseline {path}: {exc}") from exc
+    return approved
 
 
 def change_impact_report(compatibility: dict[str, Any], profile: dict[str, Any]) -> dict[str, Any]:

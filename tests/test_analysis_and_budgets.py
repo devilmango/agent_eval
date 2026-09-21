@@ -117,6 +117,41 @@ class AnalysisAndBudgetTests(unittest.TestCase):
         self.assertIn("AFFECTED overall_pass_rate", output.getvalue())
         self.assertIn("Agent Eval scenario change impact", summary_content)
 
+    def test_scenario_baseline_requires_explicit_approval_and_version_checks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            scenarios = root / "scenarios"
+            scenarios.mkdir()
+            scenario = scenarios / "greeting.yaml"
+            scenario.write_text("scenario: greet\ninput: {user: hi}\nexpected: {intent: GREET}\n", encoding="utf-8")
+            manifest = scenarios / "scenario-set.yaml"
+            manifest.write_text("scenario_set: sample\nversion: 0.1.0\nschema_version: 1\n", encoding="utf-8")
+            approved_path = root / "approved.json"
+            preview = StringIO()
+            with redirect_stdout(preview):
+                self.assertEqual(main(["scenario-baseline", str(scenarios), "--baseline", str(approved_path)]), 0)
+            self.assertFalse(approved_path.exists())
+            with redirect_stdout(StringIO()):
+                self.assertEqual(main(["scenario-baseline", str(scenarios), "--baseline", str(approved_path),
+                                       "--approve", "--approved-by", "reviewer-a"]), 0)
+            initial_baseline = json.loads(approved_path.read_text(encoding="utf-8"))
+            scenario.write_text("scenario: greet\ninput: {user: hi}\nexpected: {intent: WELCOME}\n", encoding="utf-8")
+            blocked = StringIO()
+            with redirect_stdout(blocked):
+                self.assertEqual(main(["scenario-baseline", str(scenarios), "--baseline", str(approved_path),
+                                       "--approve", "--format", "json"]), 1)
+            self.assertEqual(json.loads(approved_path.read_text(encoding="utf-8")), initial_baseline)
+            manifest.write_text("scenario_set: sample\nversion: 1.0.0\nschema_version: 1\n", encoding="utf-8")
+            scenario.write_text("scenario: greet\nversion: 2\ninput: {user: hi}\nexpected: {intent: WELCOME}\n", encoding="utf-8")
+            with redirect_stdout(StringIO()):
+                self.assertEqual(main(["scenario-baseline", str(scenarios), "--baseline", str(approved_path),
+                                       "--approve", "--approved-by", "reviewer-b", "--format", "json"]), 0)
+            approved = json.loads(approved_path.read_text(encoding="utf-8"))
+        self.assertIn("Preview only", preview.getvalue())
+        self.assertIn("per-scenario version increment", blocked.getvalue())
+        self.assertEqual(approved["approval"]["approved_by"], "reviewer-b")
+        self.assertEqual(approved["version"], "1.0.0")
+
     def test_cli_scenario_migration_and_triage(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

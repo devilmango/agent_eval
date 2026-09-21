@@ -43,6 +43,7 @@ from agent_eval.scoring import evaluate
 from agent_eval.scenario_audit import audit_scenarios, text_scenario_audit
 from agent_eval.versioning import (VersioningError, change_impact_report, compare_snapshots,
                                    migrate_scenario_versions, snapshot as scenario_snapshot,
+                                   scenario_baseline_review, write_approved_scenario_baseline,
                                    text_version_report, write_manifest)
 
 
@@ -259,6 +260,14 @@ def build_parser() -> argparse.ArgumentParser:
     version.add_argument("--output", type=Path)
     version.add_argument("--write-manifest", action="store_true", help="migrate/write scenario-set.yaml")
     version.add_argument("--migrate", action="store_true", help="bump changed scenario versions and write the recommended set version")
+
+    baseline = commands.add_parser("scenario-baseline", help="review and explicitly approve a scenario snapshot baseline")
+    baseline.add_argument("scenarios", type=Path, help="scenario YAML file or directory")
+    baseline.add_argument("--baseline", required=True, type=Path, help="approved snapshot path to review or update")
+    baseline.add_argument("--approve", action="store_true", help="write the reviewed snapshot after version checks pass")
+    baseline.add_argument("--approved-by", help="optional reviewer identifier recorded in approval metadata")
+    baseline.add_argument("--format", choices=("text", "json"), default="text")
+    baseline.add_argument("--output", type=Path, help="write the review report to a file instead of stdout")
 
     impact = commands.add_parser("scenario-impact", help="report scenario edits and the release gates they can affect")
     impact.add_argument("scenarios", type=Path)
@@ -580,6 +589,54 @@ def main(argv: list[str] | None = None) -> int:
             rendered = json.dumps(payload, indent=2, ensure_ascii=False) if args.format == "json" else text_version_report(current, compatibility)
             _write_output(args.output, rendered)
             return 1 if compatibility and (not compatibility["version_sufficient"] or compatibility["unversioned_changes"]) else 0
+        if args.command == "scenario-baseline":
+            if args.approved_by and not args.approve:
+                raise VersioningError("--approved-by can only be used with --approve")
+            scenario_dir = args.scenarios if args.scenarios.is_dir() else args.scenarios.parent
+            try:
+                baseline = (json.loads(args.baseline.read_text(encoding="utf-8"))
+                            if args.baseline.exists() else None)
+            except (OSError, json.JSONDecodeError) as exc:
+                raise VersioningError(f"could not read baseline snapshot {args.baseline}: {exc}") from exc
+            if baseline is not None and (not isinstance(baseline, dict) or not isinstance(baseline.get("scenarios"), list)):
+                raise VersioningError(f"{args.baseline}: not an Agent Eval scenario snapshot")
+            current = scenario_snapshot(all_scenarios, scenario_dir)
+            report = scenario_baseline_review(current, baseline)
+            report["baseline_path"] = str(args.baseline)
+            report["approval_requested"] = args.approve
+            report["approved"] = False
+            if args.approve and report["approval_ready"]:
+                approved = write_approved_scenario_baseline(
+                    args.baseline, current, approved_by=args.approved_by,
+                )
+                report["approved"] = True
+                report["approval"] = approved["approval"]
+            if args.format == "json":
+                rendered = json.dumps(report, indent=2, ensure_ascii=False)
+            else:
+                baseline_label = report["baseline_version"] or "not initialized"
+                action = "approved and updated" if report["approved"] else "review only"
+                lines = [f"Scenario baseline review: {report['scenario_set']}",
+                         f"Baseline version: {baseline_label}",
+                         f"Current version: {report['current_version']}",
+                         f"Changes: {len(report['added'])} added, {len(report['removed'])} removed, "
+                         f"{len(report['changed'])} changed",
+                         f"Approval check: {'READY' if report['approval_ready'] else 'BLOCKED'}"]
+                for item in report["details"]:
+                    dimensions = ", ".join(item.get("changed_dimensions", []))
+                    lines.append(f"  {item['id']}: {item['change']}" + (f" ({dimensions})" if dimensions else ""))
+                if report["approval_blockers"]:
+                    lines.extend(["", "Approval blockers:"])
+                    lines.extend(f"  - {blocker}" for blocker in report["approval_blockers"])
+                if report["approved"]:
+                    lines.extend(["", f"Baseline {action}: {args.baseline}"])
+                elif args.approve:
+                    lines.extend(["", f"Approval blocked; baseline was not changed: {args.baseline}"])
+                else:
+                    lines.extend(["", f"Preview only. Pass --approve to update {args.baseline}."])
+                rendered = "\n".join(lines)
+            _write_output(args.output, rendered)
+            return 1 if args.approve and not report["approval_ready"] else 0
         if args.command == "scenario-impact":
             scenario_dir = args.scenarios if args.scenarios.is_dir() else args.scenarios.parent
             try:

@@ -32,6 +32,8 @@ jobs:
       - name: Check scenario version snapshot, failure analysis, and execution budgets
         run: |
           agent-eval scenario-version scenarios/ --format json --output agent-eval-scenario-version.json
+          agent-eval scenario-baseline scenarios/ --baseline agent-eval-scenario-version.json --format json --output agent-eval-scenario-baseline-preview.json
+          agent-eval scenario-baseline scenarios/ --baseline agent-eval-scenario-version.json --approve --approved-by github-actions --format json --output agent-eval-scenario-baseline-review.json
           agent-eval scenario-impact scenarios/ --baseline agent-eval-scenario-version.json --profile examples/release-gates.yaml --format json --output agent-eval-scenario-impact.json --github-annotations --summary-file agent-eval-scenario-impact.md
           agent-eval scenario-audit scenarios/ --max-review-age-days 90 --format json --output agent-eval-scenario-audit.json
           agent-eval triage scenarios/ --responses examples/responses.jsonl --format json --output agent-eval-triage.json
@@ -65,6 +67,8 @@ jobs:
             agent-eval-coverage.json
             agent-eval-mutations.json
             agent-eval-scenario-version.json
+            agent-eval-scenario-baseline-review.json
+            agent-eval-scenario-baseline-preview.json
             agent-eval-scenario-impact.json
             agent-eval-scenario-impact.md
             agent-eval-scenario-audit.json

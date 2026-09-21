@@ -232,6 +232,16 @@ agent-eval scenario-version scenarios/ --baseline approved-scenarios.json
 
 Breaking contract changes recommend a major set version and require an increment to the changed scenario's `version`. Additions recommend a minor version; no contract changes recommend a patch. To migrate changed scenario versions and write the recommended set version in one step, use `--migrate` with a baseline. For a legacy/missing manifest, `--write-manifest` writes the current manifest schema. Snapshots contain hashes rather than scenario input contents.
 
+Review a proposed snapshot before changing the team baseline. The first command is preview-only; `--approve` is the explicit write step:
+
+```bash
+agent-eval scenario-baseline scenarios/ --baseline approved-scenarios.json
+agent-eval scenario-baseline scenarios/ --baseline approved-scenarios.json \
+  --approve --approved-by reliability-team --format json --output approval-report.json
+```
+
+Approval is blocked when changed scenarios lack a version increment or the scenario-set version misses its recommended bump. Use `scenario-version --baseline approved-scenarios.json --migrate` to apply the required version updates, review the resulting diff again, then approve. The baseline is replaced atomically and records its approval timestamp and optional reviewer. If the baseline path does not exist, preview the initial scenario inventory and use `--approve` to create it.
+
 Before merging a scenario edit, inspect which configured release gates it can affect:
 
 ```bash
