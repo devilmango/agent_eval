@@ -220,32 +220,52 @@ def scenario_baseline_review(current: dict[str, Any], baseline: dict[str, Any] |
     }
 
 
-def write_approved_scenario_baseline(
-    path: Path, current: dict[str, Any], *, approved_by: str | None = None,
+def approved_scenario_snapshot(
+    current: dict[str, Any], *, approved_by: str | None = None,
+    restored_from: str | None = None,
 ) -> dict[str, Any]:
-    """Atomically replace the approved snapshot after an explicit review approval."""
+    """Attach approval metadata to a behavior snapshot without changing its digest."""
     approved = dict(current)
     approval = {"approved_at": datetime.now(timezone.utc).isoformat()}
     if approved_by:
         approval["approved_by"] = approved_by
+    if restored_from:
+        approval["restored_from"] = restored_from
     approved["approval"] = approval
+    return approved
+
+
+def write_scenario_baseline(path: Path, snapshot_data: dict[str, Any]) -> None:
+    """Atomically replace a baseline JSON snapshot."""
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
         try:
             with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-                json.dump(approved, stream, ensure_ascii=False, indent=2)
+                json.dump(snapshot_data, stream, ensure_ascii=False, indent=2)
                 stream.write("\n")
             os.replace(temporary_name, path)
         except Exception:
             Path(temporary_name).unlink(missing_ok=True)
             raise
     except OSError as exc:
-        raise VersioningError(f"could not write approved scenario baseline {path}: {exc}") from exc
+        raise VersioningError(f"could not write scenario baseline {path}: {exc}") from exc
+
+
+def write_approved_scenario_baseline(
+    path: Path, current: dict[str, Any], *, approved_by: str | None = None,
+    restored_from: str | None = None,
+) -> dict[str, Any]:
+    """Atomically replace the approved snapshot after an explicit review approval."""
+    approved = approved_scenario_snapshot(current, approved_by=approved_by, restored_from=restored_from)
+    write_scenario_baseline(path, approved)
     return approved
 
 
-def change_impact_report(compatibility: dict[str, Any], profile: dict[str, Any]) -> dict[str, Any]:
+def change_impact_report(
+    compatibility: dict[str, Any], profile: dict[str, Any],
+    current_snapshot: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Map scenario contract edits to the configured release gates they can affect."""
     details = compatibility.get("details", [])
     affected_ids = {item["id"] for item in details}
@@ -270,7 +290,7 @@ def change_impact_report(compatibility: dict[str, Any], profile: dict[str, Any])
         gates.append({"type": "critical_scenario_pass_rate", "target": name, "minimum": minimum,
                       "affected": name in affected_ids,
                       "reason": "critical scenario contract changed" if name in affected_ids else "critical scenario is unchanged"})
-    return {"scenario_set": compatibility["scenario_set"],
+    report = {"scenario_set": compatibility["scenario_set"],
             "baseline_version": compatibility["baseline_version"],
             "current_version": compatibility["current_version"],
             "recommended_bump": compatibility["recommended_bump"],
@@ -279,6 +299,51 @@ def change_impact_report(compatibility: dict[str, Any], profile: dict[str, Any])
             "added": compatibility["added"], "removed": compatibility["removed"],
             "changed": compatibility["changed"], "details": details,
             "affected_gate_count": sum(gate["affected"] for gate in gates), "gates": gates}
+    if current_snapshot is not None:
+        report["evaluation_plan"] = change_aware_evaluation_plan(report, current_snapshot)
+    return report
+
+
+def change_aware_evaluation_plan(impact: dict[str, Any], current_snapshot: dict[str, Any]) -> dict[str, Any]:
+    """Build a practical run plan from changed contracts and affected release gates."""
+    rows = current_snapshot.get("scenarios", [])
+    by_id = {row["id"]: row for row in rows if isinstance(row, dict) and isinstance(row.get("id"), str)}
+    selected = {name for name in impact.get("added", []) + impact.get("changed", []) if name in by_id}
+    reasons = {name: ["scenario contract changed"] for name in selected}
+    affected_gates = [gate for gate in impact.get("gates", []) if gate.get("affected")]
+    for gate in affected_gates:
+        if gate["type"] == "overall_pass_rate":
+            targets = set(by_id)
+            reason = "overall pass-rate gate evaluates the full active scenario set"
+        elif gate["type"] == "critical_tag_pass_rate":
+            target = str(gate["target"]).casefold()
+            targets = {name for name, row in by_id.items()
+                       if target in {str(tag).casefold() for tag in row.get("behavior", {}).get("tags", [])}}
+            reason = f"scenario belongs to the affected critical tag '{gate['target']}'"
+        else:
+            targets = {gate["target"]} & set(by_id)
+            reason = "critical scenario gate is affected"
+        for name in targets:
+            reasons.setdefault(name, []).append(reason)
+    risk_focus = sorted(reasons)
+    if affected_gates:
+        for name in by_id:
+            if name not in reasons:
+                reasons[name] = ["full scenario coverage is required to validate the configured gate profile"]
+    selected_ids = sorted(reasons)
+    gate_labels = [f"{gate['type']}:{gate['target']}" for gate in affected_gates]
+    return {
+        "scenarios_to_run": selected_ids,
+        "risk_focus_scenarios": risk_focus,
+        "scenario_reasons": {name: reasons[name] for name in selected_ids},
+        "affected_gates": gate_labels,
+        "run_all_scenarios": bool(affected_gates),
+        "commands": [
+            "agent-eval run <scenario-directory> --responses <candidate-results.jsonl> --strict",
+            "agent-eval gate <scenario-directory> --runs <candidate-results.jsonl> --profile <release-gate-profile.yaml>",
+        ],
+        "note": "The commands use placeholders; provide candidate results from the agent under evaluation.",
+    }
 
 
 def write_manifest(scenario_dir: Path, current: dict[str, Any], version: str | None = None) -> Path:

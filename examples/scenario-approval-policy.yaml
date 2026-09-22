@@ -1,0 +1,7 @@
+# Optional controls applied when scenario-baseline is run with --approve.
+require_approved_by: true
+allowed_reviewers:
+  - reliability-team
+  - github-actions
+minimum_version_bump: none
+require_release_gates_passed: false

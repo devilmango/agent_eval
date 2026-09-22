@@ -82,10 +82,13 @@ class AnalysisAndBudgetTests(unittest.TestCase):
             impact = change_impact_report(compatibility, {
                 "min_overall_pass_rate": .9, "critical_tags": {"safety": 1.0},
                 "critical_scenarios": {"greet": 1.0},
-            })
-        self.assertIn("input", impact["details"][0]["changed_dimensions"])
-        self.assertEqual(impact["affected_gate_count"], 3)
-        self.assertTrue(all(gate["affected"] for gate in impact["gates"]))
+            }, current)
+            self.assertIn("input", impact["details"][0]["changed_dimensions"])
+            self.assertEqual(impact["affected_gate_count"], 3)
+            self.assertTrue(all(gate["affected"] for gate in impact["gates"]))
+            self.assertEqual(impact["evaluation_plan"]["scenarios_to_run"], ["greet"])
+            self.assertEqual(len(impact["evaluation_plan"]["affected_gates"]), 3)
+            self.assertTrue(impact["evaluation_plan"]["run_all_scenarios"])
 
     def test_cli_scenario_impact_emits_github_annotations_and_summary(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -151,6 +154,58 @@ class AnalysisAndBudgetTests(unittest.TestCase):
         self.assertIn("per-scenario version increment", blocked.getvalue())
         self.assertEqual(approved["approval"]["approved_by"], "reviewer-b")
         self.assertEqual(approved["version"], "1.0.0")
+
+    def test_scenario_baseline_history_restore_and_approval_policy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            scenarios = root / "scenarios"
+            scenarios.mkdir()
+            scenario = scenarios / "greeting.yaml"
+            scenario.write_text("scenario: greet\ninput: {user: hi}\nexpected: {intent: GREET}\n", encoding="utf-8")
+            (scenarios / "scenario-set.yaml").write_text(
+                "scenario_set: sample\nversion: 1.0.0\nschema_version: 1\n", encoding="utf-8")
+            baseline, history, policy = root / "approved.json", root / "history.jsonl", root / "policy.yaml"
+            policy.write_text("require_approved_by: true\nallowed_reviewers: [release-bot]\n"
+                              "require_release_gates_passed: true\n", encoding="utf-8")
+            profile = root / "profile.yaml"
+            profile.write_text("min_overall_pass_rate: 1.0\n", encoding="utf-8")
+            responses = root / "responses.jsonl"
+            responses.write_text('{"scenario":"greet","intent":"GREET"}\n', encoding="utf-8")
+            with redirect_stdout(StringIO()):
+                self.assertEqual(main(["scenario-baseline", str(scenarios), "--baseline", str(baseline),
+                                       "--history-log", str(history), "--policy", str(policy), "--approve"]), 1)
+                self.assertFalse(baseline.exists())
+                self.assertEqual(main(["scenario-baseline", str(scenarios), "--baseline", str(baseline),
+                                       "--history-log", str(history), "--policy", str(policy), "--approve",
+                                       "--approved-by", "release-bot"]), 1)
+                self.assertEqual(main(["scenario-baseline", str(scenarios), "--baseline", str(baseline),
+                                       "--history-log", str(history), "--policy", str(policy), "--profile",
+                                       str(profile), "--runs", str(responses), "--approve",
+                                       "--approved-by", "release-bot"]), 0)
+            first = json.loads(history.read_text(encoding="utf-8").splitlines()[0])
+            scenario.write_text("scenario: greet\nversion: 2\ninput: {user: hi}\nexpected: {intent: WELCOME}\n", encoding="utf-8")
+            (scenarios / "scenario-set.yaml").write_text(
+                "scenario_set: sample\nversion: 2.0.0\nschema_version: 1\n", encoding="utf-8")
+            with redirect_stdout(StringIO()):
+                self.assertEqual(main(["scenario-baseline", str(scenarios), "--baseline", str(baseline),
+                                       "--history-log", str(history), "--approve", "--approved-by", "release-bot"]), 0)
+            output = StringIO()
+            with redirect_stdout(output):
+                self.assertEqual(main(["scenario-baseline-history", str(history), "--format", "json"]), 0)
+            self.assertEqual(json.loads(output.getvalue())["approval_count"], 2)
+            with redirect_stdout(StringIO()):
+                self.assertEqual(main(["scenario-baseline-restore", "--baseline", str(baseline),
+                                       "--history-log", str(history), "--approval-id", first["approval_id"],
+                                       "--approve", "--approved-by", "rollback-reviewer", "--format", "json"]), 0)
+            restored = json.loads(baseline.read_text(encoding="utf-8"))
+            records = [json.loads(line) for line in history.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(restored["version"], "1.0.0")
+        self.assertEqual(restored["approval"]["restored_from"], first["approval_id"])
+        self.assertEqual(records[-1]["event"], "restore")
+        self.assertEqual(records[-1]["restored_from"], first["approval_id"])
+        self.assertEqual(records[1]["version_diff"]["from_version"], "1.0.0")
+        self.assertEqual(records[1]["version_diff"]["to_version"], "2.0.0")
+        self.assertEqual(records[1]["version_diff"]["changed_scenarios"], ["greet"])
 
     def test_cli_scenario_migration_and_triage(self):
         with tempfile.TemporaryDirectory() as directory:

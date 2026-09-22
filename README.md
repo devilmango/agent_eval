@@ -237,10 +237,29 @@ Review a proposed snapshot before changing the team baseline. The first command 
 ```bash
 agent-eval scenario-baseline scenarios/ --baseline approved-scenarios.json
 agent-eval scenario-baseline scenarios/ --baseline approved-scenarios.json \
-  --approve --approved-by reliability-team --format json --output approval-report.json
+  --approve --approved-by reliability-team --policy examples/scenario-approval-policy.yaml \
+  --format json --output approval-report.json
 ```
 
-Approval is blocked when changed scenarios lack a version increment or the scenario-set version misses its recommended bump. Use `scenario-version --baseline approved-scenarios.json --migrate` to apply the required version updates, review the resulting diff again, then approve. The baseline is replaced atomically and records its approval timestamp and optional reviewer. If the baseline path does not exist, preview the initial scenario inventory and use `--approve` to create it.
+Approval is blocked when changed scenarios lack a version increment or the scenario-set version misses its recommended bump. Use `scenario-version --baseline approved-scenarios.json --migrate` to apply the required version updates, review the resulting diff again, then approve. The baseline is replaced atomically and records its approval timestamp and optional reviewer. Each approval also appends a snapshot, SHA-256 digest, prior/current version, and added/removed/changed scenario IDs to `<baseline>.history.jsonl` (or the path passed with `--history-log`). The log stores scenario contract hashes and behavior summaries, not user input text or tool arguments. Inspect it with `scenario-baseline-history`; restore a prior approval only with the explicit `scenario-baseline-restore --approve` command:
+
+```bash
+agent-eval scenario-baseline-history approved-scenarios.json.history.jsonl --limit 10
+agent-eval scenario-baseline-restore --baseline approved-scenarios.json \
+  --history-log approved-scenarios.json.history.jsonl --approval-id <approval-id> \
+  --approve --approved-by reliability-team
+```
+
+An optional policy file can require reviewer metadata, restrict reviewer IDs, set a minimum version bump, or require a passing release gate run. `allowed_reviewers` implies that a reviewer is required. For release gate checks, pass both `--profile` and `--runs`; the result file must cover the full scenario set. A policy can combine these controls:
+
+```yaml
+require_approved_by: true
+allowed_reviewers: [reliability-team]
+minimum_version_bump: minor # none, patch, minor, or major
+require_release_gates_passed: true
+```
+
+Preview commands report policy blockers without writing the baseline. Approval is written only when version checks and every configured policy check pass.
 
 Before merging a scenario edit, inspect which configured release gates it can affect:
 
@@ -251,7 +270,7 @@ agent-eval scenario-impact scenarios/ \
   --format text
 ```
 
-The report lists added, removed, and changed scenario contracts, identifies changed behavior categories (including an input-change marker), recommends a set version bump, and maps changed scenarios and tags to overall, critical-tag, and critical-scenario gates. Snapshots include only hashes and a concise behavior summary; user input text and tool arguments are not copied. Use `--format json --output impact.json` for CI artifacts. This command reports impact without enforcing a version bump; `scenario-version --baseline` remains the version gate.
+The report lists added, removed, and changed scenario contracts, identifies changed behavior categories (including an input-change marker), recommends a set version bump, and maps changed scenarios and tags to overall, critical-tag, and critical-scenario gates. It also includes an evaluation plan listing active scenarios to run, affected gates, and ready-to-adapt command templates. Overall pass-rate gates select the full active set; critical tag and critical scenario gates select their corresponding scenarios. Snapshots include only hashes and a concise behavior summary; user input text and tool arguments are not copied. Use `--format json --output impact.json` for CI artifacts. This command reports impact without enforcing a version bump; `scenario-version --baseline` remains the version gate.
 
 For pull requests, add GitHub Actions annotations and a Markdown step summary:
 

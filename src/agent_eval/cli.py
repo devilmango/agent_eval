@@ -14,6 +14,9 @@ from agent_eval import __version__
 from agent_eval.bundles import BundleError, create_bundle, verify_bundle
 from agent_eval.calibration import CalibrationError, calibrate_judge, text_calibration_report
 from agent_eval.adapters import AdapterError, PathMappingAdapter, load_adapter_plugin, result_as_dict
+from agent_eval.approval_policies import ApprovalPolicyError, load_approval_policy, policy_blockers
+from agent_eval.baseline_history import (BaselineHistoryError, append_baseline_history,
+                                         baseline_history_report, load_baseline_history)
 from agent_eval.budgets import apply_budgets
 from agent_eval.comparison import compare_reports, paired_bootstrap_intervals, text_comparison
 from agent_eval.drafts import (
@@ -43,7 +46,8 @@ from agent_eval.scoring import evaluate
 from agent_eval.scenario_audit import audit_scenarios, text_scenario_audit
 from agent_eval.versioning import (VersioningError, change_impact_report, compare_snapshots,
                                    migrate_scenario_versions, snapshot as scenario_snapshot,
-                                   scenario_baseline_review, write_approved_scenario_baseline,
+                                   approved_scenario_snapshot, scenario_baseline_review,
+                                   write_scenario_baseline,
                                    text_version_report, write_manifest)
 
 
@@ -266,8 +270,27 @@ def build_parser() -> argparse.ArgumentParser:
     baseline.add_argument("--baseline", required=True, type=Path, help="approved snapshot path to review or update")
     baseline.add_argument("--approve", action="store_true", help="write the reviewed snapshot after version checks pass")
     baseline.add_argument("--approved-by", help="optional reviewer identifier recorded in approval metadata")
+    baseline.add_argument("--history-log", type=Path, help="append-only approval log (default: <baseline>.history.jsonl)")
+    baseline.add_argument("--policy", type=Path, help="optional YAML approval policy")
+    baseline.add_argument("--profile", type=Path, help="release gate profile used by approval policies")
+    baseline.add_argument("--runs", type=Path, help="candidate result JSONL used by release gate approval policies")
     baseline.add_argument("--format", choices=("text", "json"), default="text")
     baseline.add_argument("--output", type=Path, help="write the review report to a file instead of stdout")
+
+    baseline_history = commands.add_parser("scenario-baseline-history", help="inspect append-only scenario baseline approvals")
+    baseline_history.add_argument("history_log", type=Path)
+    baseline_history.add_argument("--limit", type=int, help="show only the most recent approvals")
+    baseline_history.add_argument("--format", choices=("text", "json"), default="text")
+    baseline_history.add_argument("--output", type=Path)
+
+    baseline_restore = commands.add_parser("scenario-baseline-restore", help="restore a previously approved scenario snapshot")
+    baseline_restore.add_argument("--baseline", required=True, type=Path)
+    baseline_restore.add_argument("--history-log", required=True, type=Path)
+    baseline_restore.add_argument("--approval-id", required=True, help="approval ID from scenario-baseline-history")
+    baseline_restore.add_argument("--approve", action="store_true", help="confirm the restore and update the baseline")
+    baseline_restore.add_argument("--approved-by", help="reviewer recorded for the restore")
+    baseline_restore.add_argument("--format", choices=("text", "json"), default="text")
+    baseline_restore.add_argument("--output", type=Path)
 
     impact = commands.add_parser("scenario-impact", help="report scenario edits and the release gates they can affect")
     impact.add_argument("scenarios", type=Path)
@@ -541,7 +564,7 @@ def main(argv: list[str] | None = None) -> int:
             print(rendered)
             return 0
 
-        all_scenarios = load_scenarios(args.scenarios)
+        all_scenarios = load_scenarios(args.scenarios) if hasattr(args, "scenarios") else []
         if args.command == "scenario-audit":
             audit_date = date.fromisoformat(args.as_of) if args.as_of else None
             report = audit_scenarios(
@@ -589,10 +612,55 @@ def main(argv: list[str] | None = None) -> int:
             rendered = json.dumps(payload, indent=2, ensure_ascii=False) if args.format == "json" else text_version_report(current, compatibility)
             _write_output(args.output, rendered)
             return 1 if compatibility and (not compatibility["version_sufficient"] or compatibility["unversioned_changes"]) else 0
+        if args.command == "scenario-baseline-history":
+            report = baseline_history_report(load_baseline_history(args.history_log), limit=args.limit)
+            if args.format == "json":
+                rendered = json.dumps(report, indent=2, ensure_ascii=False)
+            else:
+                lines = [f"Scenario baseline history: {args.history_log}",
+                         f"Approvals shown: {report['approval_count']}"]
+                for record in report["approvals"]:
+                    reviewer = record["approved_by"] or "unspecified"
+                    lines.append(f"  {record['approval_id']} {record['event']} {record['scenario_set']} "
+                                 f"{record['version']} by {reviewer} at {record['recorded_at']}")
+                rendered = "\n".join(lines)
+            _write_output(args.output, rendered)
+            return 0
+        if args.command == "scenario-baseline-restore":
+            if not args.approve:
+                raise VersioningError("restoring an approval requires explicit --approve")
+            if args.baseline.resolve() == args.history_log.resolve():
+                raise VersioningError("--baseline and --history-log must be different paths")
+            records = load_baseline_history(args.history_log)
+            source = next((record for record in records if record["approval_id"] == args.approval_id), None)
+            if source is None:
+                raise BaselineHistoryError(f"approval ID not found in history: {args.approval_id}")
+            previous = None
+            if args.baseline.exists():
+                try:
+                    previous = json.loads(args.baseline.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError) as exc:
+                    raise VersioningError(f"could not read baseline snapshot {args.baseline}: {exc}") from exc
+            restored = approved_scenario_snapshot(source["snapshot"], approved_by=args.approved_by,
+                                                  restored_from=args.approval_id)
+            record = append_baseline_history(args.history_log, restored, previous_snapshot=previous,
+                                             event="restore", approved_by=args.approved_by,
+                                             restored_from=args.approval_id)
+            write_scenario_baseline(args.baseline, restored)
+            report = {"restored": True, "baseline_path": str(args.baseline),
+                      "approval_id": record["approval_id"], "restored_from": args.approval_id,
+                      "scenario_set": restored.get("scenario_set"), "version": restored.get("version"),
+                      "approved_by": args.approved_by}
+            rendered = (json.dumps(report, indent=2, ensure_ascii=False) if args.format == "json"
+                        else f"Restored {report['scenario_set']} {report['version']} from approval "
+                             f"{args.approval_id}; restore approval {record['approval_id']} recorded.")
+            _write_output(args.output, rendered)
+            return 0
         if args.command == "scenario-baseline":
-            if args.approved_by and not args.approve:
-                raise VersioningError("--approved-by can only be used with --approve")
             scenario_dir = args.scenarios if args.scenarios.is_dir() else args.scenarios.parent
+            history_path = args.history_log or args.baseline.with_suffix(args.baseline.suffix + ".history.jsonl")
+            if args.baseline.resolve() == history_path.resolve():
+                raise VersioningError("--baseline and --history-log must be different paths")
             try:
                 baseline = (json.loads(args.baseline.read_text(encoding="utf-8"))
                             if args.baseline.exists() else None)
@@ -602,15 +670,36 @@ def main(argv: list[str] | None = None) -> int:
                 raise VersioningError(f"{args.baseline}: not an Agent Eval scenario snapshot")
             current = scenario_snapshot(all_scenarios, scenario_dir)
             report = scenario_baseline_review(current, baseline)
+            approval_policy = load_approval_policy(args.policy) if args.policy else {
+                "require_approved_by": False, "allowed_reviewers": [],
+                "minimum_version_bump": "none", "require_release_gates_passed": False,
+            }
+            release_gate_report = None
+            if args.profile or args.runs:
+                if not args.profile or not args.runs:
+                    raise ApprovalPolicyError("--profile and --runs must be supplied together")
+                release_gate_report = evaluate_release_gates(
+                    all_scenarios, [evaluate(all_scenarios, load_results(args.runs), strict=True)],
+                    load_gate_profile(args.profile),
+                )
+            policy_errors = policy_blockers(report, approval_policy, approved_by=args.approved_by,
+                                            release_gates=release_gate_report)
+            report["policy_blockers"] = policy_errors
+            report["release_gates"] = release_gate_report
+            report["approval_ready"] = report["approval_ready"] and not policy_errors
+            report["approval_blockers"].extend(policy_errors)
             report["baseline_path"] = str(args.baseline)
+            report["history_log"] = str(history_path)
             report["approval_requested"] = args.approve
             report["approved"] = False
             if args.approve and report["approval_ready"]:
-                approved = write_approved_scenario_baseline(
-                    args.baseline, current, approved_by=args.approved_by,
-                )
+                approved = approved_scenario_snapshot(current, approved_by=args.approved_by)
+                record = append_baseline_history(history_path, approved, previous_snapshot=baseline,
+                                                 approved_by=args.approved_by)
+                write_scenario_baseline(args.baseline, approved)
                 report["approved"] = True
                 report["approval"] = approved["approval"]
+                report["approval_id"] = record["approval_id"]
             if args.format == "json":
                 rendered = json.dumps(report, indent=2, ensure_ascii=False)
             else:
@@ -629,7 +718,9 @@ def main(argv: list[str] | None = None) -> int:
                     lines.extend(["", "Approval blockers:"])
                     lines.extend(f"  - {blocker}" for blocker in report["approval_blockers"])
                 if report["approved"]:
-                    lines.extend(["", f"Baseline {action}: {args.baseline}"])
+                    lines.extend(["", f"Baseline {action}: {args.baseline}",
+                                  f"Approval ID: {report['approval_id']}",
+                                  f"History log: {history_path}"])
                 elif args.approve:
                     lines.extend(["", f"Approval blocked; baseline was not changed: {args.baseline}"])
                 else:
@@ -647,7 +738,7 @@ def main(argv: list[str] | None = None) -> int:
                 raise VersioningError(f"{args.baseline}: not an Agent Eval scenario snapshot")
             current = scenario_snapshot(all_scenarios, scenario_dir)
             compatibility = compare_snapshots(current, baseline)
-            report = change_impact_report(compatibility, load_gate_profile(args.profile))
+            report = change_impact_report(compatibility, load_gate_profile(args.profile), current)
             if args.format == "json":
                 rendered = json.dumps(report, indent=2, ensure_ascii=False)
             else:
@@ -661,6 +752,11 @@ def main(argv: list[str] | None = None) -> int:
                 lines.extend(["", "Release gates:"])
                 for gate in report["gates"]:
                     lines.append(f"  {'AFFECTED' if gate['affected'] else 'unchanged'} {gate['type']} {gate['target']}: {gate['reason']}")
+                plan = report["evaluation_plan"]
+                lines.extend(["", "Suggested evaluation plan:",
+                              "  Scenarios: " + (", ".join(plan["scenarios_to_run"]) or "none"),
+                              "  Gates: " + (", ".join(plan["affected_gates"]) or "none")])
+                lines.extend(f"  $ {command}" for command in plan["commands"])
                 rendered = "\n".join(lines)
             _write_output(args.output, rendered)
             if args.github_annotations or args.summary_file:
