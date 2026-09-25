@@ -28,10 +28,14 @@ from agent_eval.graders import GraderError, load_judge_registry
 from agent_eval.history import (HistoryError, compare_history, filter_history, html_history_comparison,
                                 html_trend_report, load_history, merge_history, record_history,
                                 text_history_comparison, text_trend_report, trend_report)
+from agent_eval.history_gates import (evaluate_history_gates, load_history_gate_profile,
+                                      text_history_gate_report)
 from agent_eval.models import AgentResult
 from agent_eval.monitoring import (drift_report, experiment_matrix, github_annotation_report,
                                    github_scenario_impact_report, read_variant_spec)
 from agent_eval.otel import OpenTelemetryAdapter, load_otel_document
+from agent_eval.portable_baseline import (PortableBaselineError, export_portable_baseline,
+                                          import_portable_baseline)
 from agent_eval.quality import failure_analysis, mutation_report, scenario_coverage, scenario_suggestions, judge_agreement, text_coverage, text_mutation_report, text_failure_analysis
 from agent_eval.report import html_report, json_report, repeated_html_report, text_report
 from agent_eval.redaction import (
@@ -163,6 +167,17 @@ def build_parser() -> argparse.ArgumentParser:
     history_merge.add_argument("stores", nargs="+", type=Path, help="input history JSONL stores")
     history_merge.add_argument("--output", required=True, type=Path, help="new merged history JSONL path")
     history_merge.add_argument("--format", choices=("text", "json"), default="text")
+    history_gate = history_commands.add_parser("gate", help="gate recent evaluation quality against recorded history")
+    history_gate.add_argument("store", type=Path, help="evaluation history JSONL")
+    history_gate.add_argument("--profile", required=True, type=Path, help="YAML history release gate profile")
+    history_gate.add_argument("--limit", type=int, help="evaluate only the most recent N matching runs")
+    history_gate.add_argument("--label", action="append", help="include records with this label (repeatable)")
+    history_gate.add_argument("--model", action="append", help="include records matching this model (repeatable)")
+    history_gate.add_argument("--prompt-version", action="append", help="include records matching this prompt version (repeatable)")
+    history_gate.add_argument("--since", help="inclusive ISO-8601 date or timestamp")
+    history_gate.add_argument("--until", help="inclusive ISO-8601 date or timestamp")
+    history_gate.add_argument("--format", choices=("text", "json"), default="text")
+    history_gate.add_argument("--output", type=Path)
 
     drafts = commands.add_parser("draft-scenarios", help="create human-review YAML drafts from trace JSONL")
     drafts.add_argument("traces", type=Path, help="raw trace records as JSON Lines")
@@ -291,6 +306,21 @@ def build_parser() -> argparse.ArgumentParser:
     baseline_restore.add_argument("--approved-by", help="reviewer recorded for the restore")
     baseline_restore.add_argument("--format", choices=("text", "json"), default="text")
     baseline_restore.add_argument("--output", type=Path)
+
+    baseline_export = commands.add_parser("scenario-baseline-export", help="export a baseline as a portable integrity-checked JSON file")
+    baseline_export.add_argument("baseline", type=Path, help="approved scenario snapshot JSON")
+    baseline_export.add_argument("--output", required=True, type=Path, help="portable baseline destination")
+    baseline_export.add_argument("--format", choices=("text", "json"), default="text")
+
+    baseline_import = commands.add_parser("scenario-baseline-import", help="import a portable baseline into a scenario set")
+    baseline_import.add_argument("portable", type=Path, help="portable baseline JSON export")
+    baseline_import.add_argument("--scenarios", required=True, type=Path, help="target scenario file or directory")
+    baseline_import.add_argument("--baseline", required=True, type=Path, help="destination approved snapshot JSON")
+    baseline_import.add_argument("--history-log", type=Path, help="append-only approval log (default: <baseline>.history.jsonl)")
+    baseline_import.add_argument("--approve", action="store_true", help="confirm importing and activating this baseline")
+    baseline_import.add_argument("--approved-by", help="reviewer recorded for the import")
+    baseline_import.add_argument("--format", choices=("text", "json"), default="text")
+    baseline_import.add_argument("--output", type=Path)
 
     impact = commands.add_parser("scenario-impact", help="report scenario edits and the release gates they can affect")
     impact.add_argument("scenarios", type=Path)
@@ -517,6 +547,20 @@ def main(argv: list[str] | None = None) -> int:
                                 f"removed {report['duplicate_count']} duplicate run ID(s) into {args.output}")
                 print(rendered)
                 return 0
+            if args.history_command == "gate":
+                if args.limit is not None and args.limit < 1:
+                    raise HistoryError("history gate --limit must be at least 1")
+                records = filter_history(
+                    load_history(args.store), models=args.model, prompt_versions=args.prompt_version,
+                    labels=args.label, since=args.since, until=args.until,
+                )
+                if args.limit is not None:
+                    records = records[-args.limit:]
+                report = evaluate_history_gates(records, load_history_gate_profile(args.profile))
+                rendered = (json.dumps(report, indent=2, ensure_ascii=False) if args.format == "json"
+                            else text_history_gate_report(report))
+                _write_output(args.output, rendered)
+                return 0 if report["passed"] else 1
             if args.bundle:
                 verification = verify_bundle(args.bundle)
                 if not verification["valid"]:
@@ -626,6 +670,53 @@ def main(argv: list[str] | None = None) -> int:
                 rendered = "\n".join(lines)
             _write_output(args.output, rendered)
             return 0
+        if args.command == "scenario-baseline-export":
+            if args.baseline.resolve() == args.output.resolve():
+                raise PortableBaselineError("portable export destination must differ from the source baseline")
+            report = export_portable_baseline(args.baseline, args.output)
+            rendered = (json.dumps(report, indent=2, ensure_ascii=False) if args.format == "json"
+                        else f"Exported {report['scenario_set']} {report['version']} to {args.output} "
+                             f"(SHA-256 {report['snapshot_sha256']})")
+            print(rendered)
+            return 0
+        if args.command == "scenario-baseline-import":
+            if not args.approve:
+                raise PortableBaselineError("importing a baseline requires explicit --approve")
+            history_path = args.history_log or args.baseline.with_suffix(args.baseline.suffix + ".history.jsonl")
+            if len({args.baseline.resolve(), args.portable.resolve(), history_path.resolve()}) != 3:
+                raise PortableBaselineError("portable source, --baseline, and --history-log must be different paths")
+            imported = import_portable_baseline(args.portable)
+            scenario_dir = args.scenarios if args.scenarios.is_dir() else args.scenarios.parent
+            target_snapshot = scenario_snapshot(all_scenarios, scenario_dir)
+            if imported["scenario_set"] != target_snapshot["scenario_set"]:
+                raise PortableBaselineError(
+                    f"portable baseline is for scenario set '{imported['scenario_set']}', "
+                    f"but target is '{target_snapshot['scenario_set']}'"
+                )
+            previous = None
+            if args.baseline.exists():
+                try:
+                    previous = json.loads(args.baseline.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError) as exc:
+                    raise VersioningError(f"could not read baseline snapshot {args.baseline}: {exc}") from exc
+                if not isinstance(previous, dict) or not isinstance(previous.get("scenarios"), list):
+                    raise VersioningError(f"{args.baseline}: not an Agent Eval scenario snapshot")
+            approved = approved_scenario_snapshot(imported, approved_by=args.approved_by,
+                                                  imported_from=str(args.portable))
+            history_record = append_baseline_history(
+                history_path, approved, previous_snapshot=previous, event="import",
+                approved_by=args.approved_by, imported_from=str(args.portable),
+            )
+            write_scenario_baseline(args.baseline, approved)
+            report = {"imported": True, "baseline_path": str(args.baseline),
+                      "history_log": str(history_path), "scenario_set": approved["scenario_set"],
+                      "version": approved["version"], "approval_id": history_record["approval_id"],
+                      "imported_from": str(args.portable), "approved_by": args.approved_by}
+            rendered = (json.dumps(report, indent=2, ensure_ascii=False) if args.format == "json"
+                        else f"Imported {report['scenario_set']} {report['version']} into {args.baseline}; "
+                             f"approval {report['approval_id']} recorded.")
+            _write_output(args.output, rendered)
+            return 0
         if args.command == "scenario-baseline-restore":
             if not args.approve:
                 raise VersioningError("restoring an approval requires explicit --approve")
@@ -641,6 +732,8 @@ def main(argv: list[str] | None = None) -> int:
                     previous = json.loads(args.baseline.read_text(encoding="utf-8"))
                 except (OSError, json.JSONDecodeError) as exc:
                     raise VersioningError(f"could not read baseline snapshot {args.baseline}: {exc}") from exc
+                if not isinstance(previous, dict) or not isinstance(previous.get("scenarios"), list):
+                    raise VersioningError(f"{args.baseline}: not an Agent Eval scenario snapshot")
             restored = approved_scenario_snapshot(source["snapshot"], approved_by=args.approved_by,
                                                   restored_from=args.approval_id)
             record = append_baseline_history(args.history_log, restored, previous_snapshot=previous,

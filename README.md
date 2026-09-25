@@ -250,6 +250,16 @@ agent-eval scenario-baseline-restore --baseline approved-scenarios.json \
   --approve --approved-by reliability-team
 ```
 
+Move an approved baseline between CI jobs or repositories with the portable JSON envelope. It includes a format version and a SHA-256 digest, and import checks that the destination scenario set has the same `scenario_set` identity. Importing requires explicit approval and is written to the local approval history:
+
+```bash
+agent-eval scenario-baseline-export approved-scenarios.json --output baseline-export.json
+agent-eval scenario-baseline-import baseline-export.json --scenarios scenarios/ \
+  --baseline approved-scenarios.json --approve --approved-by reliability-team
+```
+
+The digest detects accidental changes; it does not authenticate who created an export. Use a signed artifact or another trusted transport when the origin must be verified.
+
 An optional policy file can require reviewer metadata, restrict reviewer IDs, set a minimum version bump, or require a passing release gate run. `allowed_reviewers` implies that a reviewer is required. For release gate checks, pass both `--profile` and `--runs`; the result file must cover the full scenario set. A policy can combine these controls:
 
 ```yaml
@@ -442,6 +452,15 @@ agent-eval history trend .agent-eval/history.jsonl \
 `history record` accepts canonical results or a bundle. Bundles are integrity-verified before recording. The append-only JSONL store keeps aggregate metrics, counts, selected execution metadata, labels, and compact per-scenario pass/fail outcomes; it does not copy scenario inputs or traces. Keep the store with your CI artifacts or durable storage if you need long-term trends.
 
 `history trend` supports exact model, prompt version, and label filters (repeat each flag to match any supplied value), plus inclusive ISO-8601 `--since` and `--until` bounds. Filtering happens before `--limit`, so the limit applies to the latest matching runs. The HTML report is self-contained and escapes stored labels and metadata.
+
+Gate a recent history window against quality and regression thresholds. The profile can require a minimum number of runs, average and latest pass rates, cap the drop from the oldest to newest selected run, and enforce per-scenario pass rates. Missing critical scenario outcomes fail that scenario gate:
+
+```bash
+agent-eval history gate .agent-eval/history.jsonl \
+  --profile examples/history-release-gates.yaml --limit 10 --format json
+```
+
+The profile's `min_runs` controls the minimum sample size. Average pass rate gives each selected run equal weight; `max_pass_rate_drop` compares the oldest and newest pass rates in the selected window. Use `--label`, `--model`, `--prompt-version`, `--since`, and `--until` to select a release or model window before the most recent `--limit` is applied. Insufficient history or a threshold regression returns exit code `1`, so the command can gate CI releases.
 
 Compare two or more selected runs or releases in one view:
 

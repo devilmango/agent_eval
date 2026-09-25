@@ -1,0 +1,7 @@
+# Thresholds applied to the selected recent window in an evaluation history store.
+min_runs: 2
+min_average_pass_rate: 0.95
+min_latest_pass_rate: 0.95
+max_pass_rate_drop: 0.05
+critical_scenarios:
+  appointment_reschedule: 1.0

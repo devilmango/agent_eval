@@ -15,9 +15,49 @@ from agent_eval.drafts import (
 from agent_eval.scenarios import load_scenario
 from agent_eval.history import (HistoryError, compare_history, filter_history, html_history_comparison,
                                 html_trend_report, load_history, merge_history, record_history, trend_report)
+from agent_eval.history_gates import evaluate_history_gates, load_history_gate_profile
 
 
 class HistoryTests(unittest.TestCase):
+    def test_history_release_gates_check_window_quality_trend_and_critical_coverage(self):
+        records = [
+            {"run_id": "a", "recorded_at": "2026-01-01T00:00:00+00:00", "pass_rate": 1.0,
+             "scenario_results": {"safety": True}},
+            {"run_id": "b", "recorded_at": "2026-01-02T00:00:00+00:00", "pass_rate": 0.9,
+             "scenario_results": {"safety": False}},
+        ]
+        report = evaluate_history_gates(records, {
+            "min_runs": 2, "min_average_pass_rate": 0.94, "min_latest_pass_rate": 0.95,
+            "max_pass_rate_drop": 0.05, "critical_scenarios": {"safety": 1.0},
+        })
+        self.assertFalse(report["passed"])
+        self.assertAlmostEqual(report["average_pass_rate"], 0.95)
+        self.assertAlmostEqual(report["pass_rate_drop"], 0.1)
+        self.assertEqual(report["run_count"], 2)
+        safety_gate = next(gate for gate in report["gates"] if gate.get("target") == "safety")
+        self.assertFalse(safety_gate["passed"])
+        incomplete = evaluate_history_gates(records, {
+            "min_runs": 1, "critical_scenarios": {"missing": 0.0},
+        })
+        self.assertFalse(incomplete["passed"])
+
+    def test_history_gate_cli_uses_filtered_recent_window(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store, profile, output = root / "history.jsonl", root / "profile.yaml", root / "gate.json"
+            record = {"schema_version": 1, "run_id": "run", "recorded_at": "2026-01-01T00:00:00+00:00",
+                      "label": "release", "total": 1, "passed": 1, "failed": 0, "pass_rate": 1.0,
+                      "metrics": {}, "critical_scenarios": {"safety": True},
+                      "scenario_results": {"safety": True}, "models": [], "prompt_versions": []}
+            store.write_text(json.dumps(record) + "\n", encoding="utf-8")
+            profile.write_text("min_runs: 1\nmin_average_pass_rate: 1.0\ncritical_scenarios:\n  safety: 1.0\n",
+                               encoding="utf-8")
+            with redirect_stdout(StringIO()):
+                status = main(["history", "gate", str(store), "--profile", str(profile),
+                               "--label", "release", "--format", "json", "--output", str(output)])
+            self.assertEqual(status, 0)
+            self.assertTrue(json.loads(output.read_text(encoding="utf-8"))["passed"])
+
     def test_history_appends_compact_reports_and_computes_trends(self):
         report = {
             "total": 4,

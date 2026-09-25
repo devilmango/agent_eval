@@ -37,7 +37,7 @@ def load_baseline_history(path: Path) -> list[dict[str, Any]]:
         if (not isinstance(record, dict) or record.get("schema_version") != 1
                 or not isinstance(record.get("approval_id"), str)
                 or not isinstance(record.get("recorded_at"), str)
-                or record.get("event") not in {"approval", "restore"}
+                or record.get("event") not in {"approval", "restore", "import"}
                 or not isinstance(record.get("snapshot"), dict)):
             raise BaselineHistoryError(f"{path}:{number}: malformed baseline history record")
         if record.get("snapshot_sha256") != snapshot_digest(record["snapshot"]):
@@ -49,11 +49,11 @@ def load_baseline_history(path: Path) -> list[dict[str, Any]]:
 def append_baseline_history(
     path: Path, snapshot: dict[str, Any], *, previous_snapshot: dict[str, Any] | None,
     event: str = "approval", approved_by: str | None = None,
-    restored_from: str | None = None,
+    restored_from: str | None = None, imported_from: str | None = None,
 ) -> dict[str, Any]:
     """Record an approved snapshot and retain the full, input-free snapshot for recovery."""
-    if event not in {"approval", "restore"}:
-        raise BaselineHistoryError("baseline history event must be approval or restore")
+    if event not in {"approval", "restore", "import"}:
+        raise BaselineHistoryError("baseline history event must be approval, restore, or import")
     previous_rows = {row["id"]: row for row in previous_snapshot.get("scenarios", [])
                      if isinstance(row, dict) and isinstance(row.get("id"), str)} if previous_snapshot else {}
     current_rows = {row["id"]: row for row in snapshot.get("scenarios", [])
@@ -81,6 +81,7 @@ def append_baseline_history(
         "previous_snapshot_sha256": snapshot_digest(previous_snapshot) if previous_snapshot else None,
         "snapshot_sha256": snapshot_digest(snapshot),
         "restored_from": restored_from,
+        "imported_from": imported_from,
         "snapshot": snapshot,
     }
     try:
@@ -105,7 +106,7 @@ def baseline_history_report(records: list[dict[str, Any]], *, limit: int | None 
     return {"approval_count": len(selected), "approvals": [
         {key: record.get(key) for key in (
             "approval_id", "event", "recorded_at", "approved_by", "scenario_set", "version",
-            "version_diff", "previous_snapshot_sha256", "snapshot_sha256", "restored_from",
+            "version_diff", "previous_snapshot_sha256", "snapshot_sha256", "restored_from", "imported_from",
         )}
         for record in selected
     ]}

@@ -11,6 +11,7 @@ from agent_eval.models import AgentResult, Scenario
 from agent_eval.quality import failure_analysis
 from agent_eval.scenarios import load_scenarios
 from agent_eval.scoring import evaluate
+from agent_eval.portable_baseline import PortableBaselineError, import_portable_baseline
 from agent_eval.versioning import change_impact_report, compare_snapshots, migrate_scenario_versions, snapshot, write_manifest
 
 
@@ -206,6 +207,42 @@ class AnalysisAndBudgetTests(unittest.TestCase):
         self.assertEqual(records[1]["version_diff"]["from_version"], "1.0.0")
         self.assertEqual(records[1]["version_diff"]["to_version"], "2.0.0")
         self.assertEqual(records[1]["version_diff"]["changed_scenarios"], ["greet"])
+
+    def test_portable_scenario_baseline_export_import_checks_digest_and_set_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_dir, target_dir = root / "source", root / "target"
+            source_dir.mkdir()
+            target_dir.mkdir()
+            manifest = "scenario_set: shared-support\nversion: 1.0.0\nschema_version: 1\n"
+            (source_dir / "scenario-set.yaml").write_text(manifest, encoding="utf-8")
+            (source_dir / "greeting.yaml").write_text(
+                "scenario: greet\ninput: {user: hi}\nexpected: {intent: GREET}\n", encoding="utf-8")
+            (target_dir / "scenario-set.yaml").write_text(manifest, encoding="utf-8")
+            (target_dir / "greeting.yaml").write_text(
+                "scenario: greet\nversion: 2\ninput: {user: hi}\nexpected: {intent: WELCOME}\n", encoding="utf-8")
+            source_baseline, portable, imported = root / "source.json", root / "portable.json", root / "imported.json"
+            history = root / "import-history.jsonl"
+            with redirect_stdout(StringIO()):
+                self.assertEqual(main(["scenario-version", str(source_dir), "--format", "json",
+                                       "--output", str(source_baseline)]), 0)
+                self.assertEqual(main(["scenario-baseline-export", str(source_baseline),
+                                       "--output", str(portable)]), 0)
+                self.assertEqual(main(["scenario-baseline-import", str(portable), "--scenarios", str(target_dir),
+                                       "--baseline", str(imported), "--history-log", str(history), "--approve",
+                                       "--approved-by", "release-reviewer", "--format", "json"]), 0)
+            imported_data = json.loads(imported.read_text(encoding="utf-8"))
+            import_record = json.loads(history.read_text(encoding="utf-8").splitlines()[0])
+            envelope = json.loads(portable.read_text(encoding="utf-8"))
+            envelope["snapshot"]["version"] = "9.0.0"
+            tampered = root / "tampered.json"
+            tampered.write_text(json.dumps(envelope), encoding="utf-8")
+            with self.assertRaisesRegex(PortableBaselineError, "digest does not match"):
+                import_portable_baseline(tampered)
+        self.assertEqual(imported_data["scenario_set"], "shared-support")
+        self.assertEqual(imported_data["approval"]["approved_by"], "release-reviewer")
+        self.assertEqual(import_record["event"], "import")
+        self.assertEqual(import_record["version_diff"]["changed_scenarios"], [])
 
     def test_cli_scenario_migration_and_triage(self):
         with tempfile.TemporaryDirectory() as directory:

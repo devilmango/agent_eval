@@ -30,6 +30,12 @@ def _validate_record(record: Any, source: str) -> dict[str, Any]:
         not isinstance(value, (int, float)) or isinstance(value, bool) or not isfinite(value)
     ) for value in record["metrics"].values()):
         raise HistoryError(f"{source}: metric values must be numbers or null")
+    pass_rate = record.get("pass_rate")
+    if pass_rate is not None and (
+        not isinstance(pass_rate, (int, float)) or isinstance(pass_rate, bool)
+        or not isfinite(pass_rate) or not 0 <= pass_rate <= 1
+    ):
+        raise HistoryError(f"{source}: pass_rate must be a number between 0 and 1 or null")
     for key in ("critical_scenarios", "scenario_results"):
         values = record.get(key, {})
         if not isinstance(values, dict) or any(not isinstance(name, str) or not isinstance(passed, bool)

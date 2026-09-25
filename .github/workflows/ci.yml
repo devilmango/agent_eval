@@ -35,6 +35,8 @@ jobs:
           agent-eval scenario-baseline scenarios/ --baseline agent-eval-scenario-version.json --history-log agent-eval-scenario-baseline-history.jsonl --policy examples/scenario-approval-policy.yaml --format json --output agent-eval-scenario-baseline-preview.json
           agent-eval scenario-baseline scenarios/ --baseline agent-eval-scenario-version.json --history-log agent-eval-scenario-baseline-history.jsonl --policy examples/scenario-approval-policy.yaml --approve --approved-by github-actions --format json --output agent-eval-scenario-baseline-review.json
           agent-eval scenario-baseline-history agent-eval-scenario-baseline-history.jsonl --format json --output agent-eval-scenario-baseline-history.json
+          agent-eval scenario-baseline-export agent-eval-scenario-version.json --output agent-eval-scenario-baseline.portable.json
+          agent-eval scenario-baseline-import agent-eval-scenario-baseline.portable.json --scenarios scenarios/ --baseline agent-eval-scenario-baseline-imported.json --history-log agent-eval-scenario-baseline-import-history.jsonl --approve --approved-by github-actions --format json --output agent-eval-scenario-baseline-import.json
           agent-eval scenario-impact scenarios/ --baseline agent-eval-scenario-version.json --profile examples/release-gates.yaml --format json --output agent-eval-scenario-impact.json --github-annotations --summary-file agent-eval-scenario-impact.md
           agent-eval scenario-audit scenarios/ --max-review-age-days 90 --format json --output agent-eval-scenario-audit.json
           agent-eval triage scenarios/ --responses examples/responses.jsonl --format json --output agent-eval-triage.json
@@ -50,6 +52,7 @@ jobs:
           agent-eval redaction-audit examples/draft-traces.jsonl --config examples/trace-redaction.yaml --strict --format json --output agent-eval-redaction-audit.json
           agent-eval history record --bundle agent-eval-bundle --store agent-eval-history.jsonl --label ci-run
           agent-eval history record --scenarios scenarios/ --responses examples/responses.jsonl --store agent-eval-history.jsonl --label ci-run
+          agent-eval history gate agent-eval-history.jsonl --profile examples/history-release-gates.yaml --label ci-run --format json --output agent-eval-history-gate.json
           agent-eval history trend agent-eval-history.jsonl --format json --output agent-eval-history-trend.json
           agent-eval history compare agent-eval-history.jsonl --label ci-run --format json --output agent-eval-history-comparison.json
           agent-eval history trend agent-eval-history.jsonl --label ci-run --format html --output agent-eval-history.html
@@ -72,6 +75,10 @@ jobs:
             agent-eval-scenario-baseline-preview.json
             agent-eval-scenario-baseline-history.json
             agent-eval-scenario-baseline-history.jsonl
+            agent-eval-scenario-baseline.portable.json
+            agent-eval-scenario-baseline-imported.json
+            agent-eval-scenario-baseline-import-history.jsonl
+            agent-eval-scenario-baseline-import.json
             agent-eval-scenario-impact.json
             agent-eval-scenario-impact.md
             agent-eval-scenario-audit.json
@@ -83,6 +90,7 @@ jobs:
             agent-eval-history.jsonl
             agent-eval-history-trend.json
             agent-eval-history-comparison.json
+            agent-eval-history-gate.json
             agent-eval-history-merged.jsonl
             agent-eval-history.html
             agent-eval-redaction-audit.json

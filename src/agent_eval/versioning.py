@@ -222,7 +222,7 @@ def scenario_baseline_review(current: dict[str, Any], baseline: dict[str, Any] |
 
 def approved_scenario_snapshot(
     current: dict[str, Any], *, approved_by: str | None = None,
-    restored_from: str | None = None,
+    restored_from: str | None = None, imported_from: str | None = None,
 ) -> dict[str, Any]:
     """Attach approval metadata to a behavior snapshot without changing its digest."""
     approved = dict(current)
@@ -231,6 +231,8 @@ def approved_scenario_snapshot(
         approval["approved_by"] = approved_by
     if restored_from:
         approval["restored_from"] = restored_from
+    if imported_from:
+        approval["imported_from"] = imported_from
     approved["approval"] = approval
     return approved
 
