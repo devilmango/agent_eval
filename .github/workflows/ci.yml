@@ -16,13 +16,15 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: Install package
-        run: python -m pip install -e .
+        run: python -m pip install -e ".[signing]"
       - name: Run validation suite
         run: python -m unittest discover -s tests -v
       - name: Validate sample run and create HTML report
         run: agent-eval run scenarios/ --responses examples/responses.jsonl --strict --format html --output agent-eval-report.html --bundle-dir agent-eval-bundle
       - name: Verify reproducible run bundle
         run: agent-eval verify-bundle agent-eval-bundle
+      - name: Replay verified run bundle
+        run: agent-eval replay-bundle agent-eval-bundle --strict --format json --output agent-eval-replay.json
       - name: Check repeated-run confidence gate
         run: agent-eval repeat scenarios/ --runs examples/responses.jsonl examples/responses.jsonl --min-runs 2 --confidence 0.95 --min-pass-rate 0.60 --strict --format html --output agent-eval-stability.html
       - name: Audit scenario coverage and mutation sensitivity
@@ -67,6 +69,7 @@ jobs:
           name: agent-eval-report-python-${{ matrix.python-version }}
           path: |
             agent-eval-report.html
+            agent-eval-replay.json
             agent-eval-stability.html
             agent-eval-coverage.json
             agent-eval-mutations.json

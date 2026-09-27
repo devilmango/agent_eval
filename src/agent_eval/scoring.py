@@ -140,6 +140,7 @@ def score_scenario(
     grader_registry: dict[str, AnswerGrader] | None = None,
     judge_registry: dict[str, SemanticJudge] | None = None,
     *, judge_cache: Path | None = None, judge_repetitions: int = 1,
+    skip_semantic_judges: bool = False,
 ) -> ScenarioScore:
     intent_correct = scenario.intent.strip().casefold() == result.intent.strip().casefold()
     asked = _normalized(result.asked)
@@ -189,6 +190,7 @@ def score_scenario(
         judge_registry,
         judge_cache=judge_cache,
         judge_repetitions=judge_repetitions,
+        skip_semantic_judges=skip_semantic_judges,
     ) if scenario.answer_graders else ()
     turn_violations = _check_turn_expectations(scenario, result)
 
@@ -198,7 +200,7 @@ def score_scenario(
         and not violations
         and not unnecessary
         and tool_correct is not False
-        and all(grade.passed for grade in answer_grades)
+        and all(grade.passed or grade.metadata.get("skipped") is True for grade in answer_grades)
         and not turn_violations
     )
     return ScenarioScore(
@@ -223,6 +225,7 @@ def score_scenario(
 def evaluate(
     scenarios: list[Scenario], results: dict[str, AgentResult], *, strict: bool = False,
     judge_cache: Path | None = None, judge_repetitions: int = 1,
+    skip_semantic_judges: bool = False,
 ) -> EvaluationReport:
     expected_names = {scenario.name for scenario in scenarios}
     unknown = sorted(results.keys() - expected_names)
@@ -236,7 +239,8 @@ def evaluate(
     grader_registry = load_grader_registry() if has_graders else {}
     judge_registry = (
         load_judge_registry()
-        if any(spec.get("type") == "llm_judge" for scenario in scenarios for spec in scenario.answer_graders)
+        if not skip_semantic_judges
+        and any(spec.get("type") == "llm_judge" for scenario in scenarios for spec in scenario.answer_graders)
         else {}
     )
 
@@ -276,7 +280,8 @@ def evaluate(
             )
         else:
             scores.append(score_scenario(scenario, result, grader_registry, judge_registry,
-                                         judge_cache=judge_cache, judge_repetitions=judge_repetitions))
+                                         judge_cache=judge_cache, judge_repetitions=judge_repetitions,
+                                         skip_semantic_judges=skip_semantic_judges))
 
     total = len(scores)
     passed = sum(score.passed for score in scores)
@@ -286,7 +291,8 @@ def evaluate(
     violations = sum(len(score.policy_violations) for score in scores)
     asked_count = sum(len(result.asked) for result in results.values())
     unnecessary_count = sum(len(score.unnecessary_questions) for score in scores)
-    answer_scores = [grade.score for score in scores for grade in score.answer_grades]
+    answer_scores = [grade.score for score in scores for grade in score.answer_grades
+                     if grade.metadata.get("skipped") is not True]
 
     metadata_rows = [result.metadata for result in results.values() if result.metadata]
     execution: dict = {"runs_with_metadata": len(metadata_rows)}

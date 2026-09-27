@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import date
+from math import isfinite
 import json
 import os
 import sys
@@ -11,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from agent_eval import __version__
-from agent_eval.bundles import BundleError, create_bundle, verify_bundle
+from agent_eval.bundles import BundleError, create_bundle, replay_bundle, verify_bundle
 from agent_eval.calibration import CalibrationError, calibrate_judge, text_calibration_report
 from agent_eval.adapters import AdapterError, PathMappingAdapter, load_adapter_plugin, result_as_dict
 from agent_eval.approval_policies import ApprovalPolicyError, load_approval_policy, policy_blockers
@@ -176,6 +177,14 @@ def build_parser() -> argparse.ArgumentParser:
     history_gate.add_argument("--prompt-version", action="append", help="include records matching this prompt version (repeatable)")
     history_gate.add_argument("--since", help="inclusive ISO-8601 date or timestamp")
     history_gate.add_argument("--until", help="inclusive ISO-8601 date or timestamp")
+    history_gate.add_argument("--max-average-cost-usd", type=float,
+                              help="fail if average recorded total cost exceeds this amount")
+    history_gate.add_argument("--max-latest-cost-usd", type=float,
+                              help="fail if the latest run's recorded total cost exceeds this amount")
+    history_gate.add_argument("--max-average-latency-ms", type=float,
+                              help="fail if average recorded mean latency exceeds this value")
+    history_gate.add_argument("--max-latest-latency-ms", type=float,
+                              help="fail if the latest run's recorded mean latency exceeds this value")
     history_gate.add_argument("--format", choices=("text", "json"), default="text")
     history_gate.add_argument("--output", type=Path)
 
@@ -310,6 +319,8 @@ def build_parser() -> argparse.ArgumentParser:
     baseline_export = commands.add_parser("scenario-baseline-export", help="export a baseline as a portable integrity-checked JSON file")
     baseline_export.add_argument("baseline", type=Path, help="approved scenario snapshot JSON")
     baseline_export.add_argument("--output", required=True, type=Path, help="portable baseline destination")
+    baseline_export.add_argument("--private-key", type=Path, help="optional Ed25519 private PEM key used to sign the export")
+    baseline_export.add_argument("--key-id", help="optional identifier recorded with the signature")
     baseline_export.add_argument("--format", choices=("text", "json"), default="text")
 
     baseline_import = commands.add_parser("scenario-baseline-import", help="import a portable baseline into a scenario set")
@@ -319,6 +330,8 @@ def build_parser() -> argparse.ArgumentParser:
     baseline_import.add_argument("--history-log", type=Path, help="append-only approval log (default: <baseline>.history.jsonl)")
     baseline_import.add_argument("--approve", action="store_true", help="confirm importing and activating this baseline")
     baseline_import.add_argument("--approved-by", help="reviewer recorded for the import")
+    baseline_import.add_argument("--public-key", type=Path, help="trusted Ed25519 public PEM key for signed imports")
+    baseline_import.add_argument("--require-signature", action="store_true", help="reject unsigned portable baselines")
     baseline_import.add_argument("--format", choices=("text", "json"), default="text")
     baseline_import.add_argument("--output", type=Path)
 
@@ -344,6 +357,20 @@ def build_parser() -> argparse.ArgumentParser:
     verify.add_argument("bundle", type=Path)
     verify.add_argument("--format", choices=("text", "json"), default="text")
     verify.add_argument("--output", type=Path)
+
+    replay = commands.add_parser(
+        "replay-bundle",
+        help="re-score a verified bundle without running its agent (semantic judge plugins may make provider calls)",
+    )
+    replay.add_argument("bundle", type=Path, help="self-contained evaluation bundle")
+    replay.add_argument("--format", choices=("text", "json", "html"), default="text")
+    replay.add_argument("--output", type=Path, help="write the fresh report instead of stdout")
+    replay.add_argument("--strict", action="store_true", help="fail when a bundle is missing scenario results")
+    replay.add_argument("--judge-cache", type=Path, help="cache semantic judge results in this JSON file")
+    replay.add_argument("--judge-repetitions", type=int, default=1,
+                        help="repeat semantic judgments for stability (default: 1)")
+    replay.add_argument("--no-judges", action="store_true",
+                        help="skip semantic judge graders; deterministic local graders still run")
 
     mutate = commands.add_parser("mutate", help="check whether scenarios catch representative trace regressions")
     mutate.add_argument("scenarios", type=Path, help="scenario YAML file or directory")
@@ -420,6 +447,23 @@ def main(argv: list[str] | None = None) -> int:
             )
             _write_output(args.output, rendered)
             return 0 if verification["valid"] else 1
+
+        if args.command == "replay-bundle":
+            if args.judge_repetitions < 1:
+                raise GraderError("--judge-repetitions must be at least one")
+            verification, report = replay_bundle(
+                args.bundle, strict=args.strict, judge_cache=args.judge_cache,
+                judge_repetitions=args.judge_repetitions,
+                skip_semantic_judges=args.no_judges,
+            )
+            if args.format == "json":
+                rendered = json_report(report)
+            elif args.format == "html":
+                rendered = html_report(report)
+            else:
+                rendered = f"Replayed bundle {verification['run_id']}\n\n{text_report(report)}"
+            _write_output(args.output, rendered)
+            return 0 if report.failed == 0 else 1
 
         if args.command == "redaction-audit":
             rules = load_redaction_rules(args.config)
@@ -556,7 +600,15 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 if args.limit is not None:
                     records = records[-args.limit:]
-                report = evaluate_history_gates(records, load_history_gate_profile(args.profile))
+                profile = load_history_gate_profile(args.profile)
+                for name in ("max_average_cost_usd", "max_latest_cost_usd",
+                             "max_average_latency_ms", "max_latest_latency_ms"):
+                    value = getattr(args, name)
+                    if value is not None:
+                        if not isfinite(value) or value < 0:
+                            raise HistoryError(f"history gate --{name.replace('_', '-')} must be a finite non-negative number")
+                        profile[name] = value
+                report = evaluate_history_gates(records, profile)
                 rendered = (json.dumps(report, indent=2, ensure_ascii=False) if args.format == "json"
                             else text_history_gate_report(report))
                 _write_output(args.output, rendered)
@@ -673,10 +725,12 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "scenario-baseline-export":
             if args.baseline.resolve() == args.output.resolve():
                 raise PortableBaselineError("portable export destination must differ from the source baseline")
-            report = export_portable_baseline(args.baseline, args.output)
+            report = export_portable_baseline(args.baseline, args.output,
+                                              private_key_path=args.private_key, key_id=args.key_id)
             rendered = (json.dumps(report, indent=2, ensure_ascii=False) if args.format == "json"
                         else f"Exported {report['scenario_set']} {report['version']} to {args.output} "
-                             f"(SHA-256 {report['snapshot_sha256']})")
+                             f"(SHA-256 {report['snapshot_sha256']}; "
+                             f"{'signed with ' + report['key_id'] if report['signed'] else 'unsigned'})")
             print(rendered)
             return 0
         if args.command == "scenario-baseline-import":
@@ -685,7 +739,10 @@ def main(argv: list[str] | None = None) -> int:
             history_path = args.history_log or args.baseline.with_suffix(args.baseline.suffix + ".history.jsonl")
             if len({args.baseline.resolve(), args.portable.resolve(), history_path.resolve()}) != 3:
                 raise PortableBaselineError("portable source, --baseline, and --history-log must be different paths")
-            imported = import_portable_baseline(args.portable)
+            imported = import_portable_baseline(
+                args.portable, public_key_path=args.public_key,
+                require_signature=args.require_signature,
+            )
             scenario_dir = args.scenarios if args.scenarios.is_dir() else args.scenarios.parent
             target_snapshot = scenario_snapshot(all_scenarios, scenario_dir)
             if imported["scenario_set"] != target_snapshot["scenario_set"]:

@@ -28,10 +28,13 @@ The core package has no model-provider or agent-framework dependency. Optional r
 - **Execution budgets** — gate total cost/tokens and p95 scenario latency in local runs or CI.
 - **Gold-set judge calibration** — measure semantic judge accuracy against human-labeled cases, including precision, recall, F1, and score calibration.
 - **Reproducible run bundles** — package evaluated scenarios, results, reports, settings, and integrity hashes for later review or replay.
+- **Bundle replay** — re-score recorded scenarios and results with the current evaluator without starting the agent runner.
 - **Pull request annotations** — surface scenario regressions as GitHub Actions annotations and add a metric comparison to the job summary.
 - **Behavior drift monitoring** — compare sampled current traces with a baseline and fail when metric movement or scenario regressions exceed configured limits.
 - **Model and prompt experiments** — score named result sets side by side, including quality, cost, token usage, and latency metadata.
 - **Evaluation history** — append compact run or bundle summaries to JSONL and inspect filtered pass-rate and metric trends as text, JSON, or HTML.
+- **Historical execution gates** — fail selected history windows when average or latest recorded cost and latency exceed their limits.
+- **Signed portable baselines** — optionally sign baseline exports with Ed25519 and verify signatures before importing them.
 - **Trace-to-scenario drafts** — convert observed traces into review-only YAML drafts, track approvals, detect duplicate inputs, and promote reviewed scenarios.
 - **Confidence-aware comparisons** — estimate paired bootstrap intervals for pass rate and scenario-level quality metrics in candidate and experiment comparisons.
 - **Risk-based release gates** — apply separate pass-rate thresholds to the full suite, critical tags, and named scenarios across repeated runs.
@@ -258,7 +261,18 @@ agent-eval scenario-baseline-import baseline-export.json --scenarios scenarios/ 
   --baseline approved-scenarios.json --approve --approved-by reliability-team
 ```
 
-The digest detects accidental changes; it does not authenticate who created an export. Use a signed artifact or another trusted transport when the origin must be verified.
+The digest detects accidental changes; it does not authenticate who created an export. For authenticity checks, install the optional signing dependency and export with an Ed25519 private PEM key. Share the trusted public key separately; the envelope contains a key ID and signature, never the private key:
+
+```bash
+python -m pip install 'agent-eval[signing]'
+agent-eval scenario-baseline-export approved-scenarios.json --output baseline-export.json \
+  --private-key keys/baseline-ed25519-private.pem --key-id reliability-team
+agent-eval scenario-baseline-import baseline-export.json --scenarios scenarios/ \
+  --baseline approved-scenarios.json --approve --public-key keys/baseline-ed25519-public.pem \
+  --require-signature
+```
+
+Signed imports always require a matching `--public-key`. `--require-signature` also rejects unsigned legacy exports. Unsigned imports remain supported by default for backward compatibility. The signature covers the complete portable envelope payload, including its digest and export metadata; the SHA-256 digest continues to check snapshot integrity independently.
 
 An optional policy file can require reviewer metadata, restrict reviewer IDs, set a minimum version bump, or require a passing release gate run. `allowed_reviewers` implies that a reviewer is required. For release gate checks, pass both `--profile` and `--runs`; the result file must cover the full scenario set. A policy can combine these controls:
 
@@ -416,7 +430,13 @@ agent-eval run scenarios/ --responses run.jsonl --strict \
 agent-eval verify-bundle artifacts/evaluation-2026-10-13
 ```
 
-Bundles contain the selected scenario YAML files, scenario version snapshot, normalized `results.jsonl`, JSON report, run settings, and a SHA-256 inventory. Verification checks every listed file and the bundle run ID. Re-run an evaluation with `agent-eval run artifacts/evaluation-2026-10-13/scenarios --responses artifacts/evaluation-2026-10-13/results.jsonl --strict`. Bundle directories must be new; existing destinations are never overwritten. Bundles copy scenario inputs and captured results, so protect them like the source data.
+Bundles contain the selected scenario YAML files, scenario version snapshot, normalized `results.jsonl`, JSON report, run settings, and a SHA-256 inventory. Verification checks every listed file and the bundle run ID. Replay a verified bundle with the current evaluator:
+
+```bash
+agent-eval replay-bundle artifacts/evaluation-2026-10-13 --strict --format html --output replay.html
+```
+
+Replay never invokes the agent runner. It reuses the recorded outputs and can produce different scores after evaluator changes. If a scenario declares a semantic judge, replay runs that judge unless `--no-judges` is set; semantic judges may call their configured provider. With `--no-judges`, those grades are marked skipped and do not affect the scenario result. Bundle directories must be new; existing destinations are never overwritten. Bundles copy scenario inputs and captured results, so protect them like the source data.
 
 Semantic judges can be repeated and cached during evaluation. Cache files should be treated as evaluation artifacts because they contain judge scores, rationales, and request fingerprints:
 
@@ -453,7 +473,7 @@ agent-eval history trend .agent-eval/history.jsonl \
 
 `history trend` supports exact model, prompt version, and label filters (repeat each flag to match any supplied value), plus inclusive ISO-8601 `--since` and `--until` bounds. Filtering happens before `--limit`, so the limit applies to the latest matching runs. The HTML report is self-contained and escapes stored labels and metadata.
 
-Gate a recent history window against quality and regression thresholds. The profile can require a minimum number of runs, average and latest pass rates, cap the drop from the oldest to newest selected run, and enforce per-scenario pass rates. Missing critical scenario outcomes fail that scenario gate:
+Gate a recent history window against quality, execution budgets, and regression thresholds. The profile can require a minimum number of runs, average and latest pass rates, cap the drop from the oldest to newest selected run, enforce per-scenario pass rates, and cap average or latest run cost and mean latency. The four execution limits can also be supplied as `--max-average-cost-usd`, `--max-latest-cost-usd`, `--max-average-latency-ms`, and `--max-latest-latency-ms`. Cost uses each run's recorded total USD amount; latency uses its recorded mean in milliseconds. Missing metrics fail a configured gate:
 
 ```bash
 agent-eval history gate .agent-eval/history.jsonl \

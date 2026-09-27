@@ -27,6 +27,12 @@ def text_report(report: EvaluationReport, *, details: bool = True) -> str:
         f"Answer quality:        {format_percent(report.answer_quality_score)}",
     ]
     budget_gates = report.execution.get("budget_gates", {})
+    skipped_grades = sum(
+        grade.metadata.get("skipped") is True
+        for score in report.scores for grade in score.answer_grades
+    )
+    if skipped_grades:
+        lines.extend(["", f"Semantic judge grades skipped: {skipped_grades}"])
     if budget_gates:
         lines.extend(["", "Execution budgets:"])
         for name, gate in budget_gates.items():
@@ -53,6 +59,8 @@ def text_report(report: EvaluationReport, *, details: bool = True) -> str:
             if score.notes:
                 reasons.append(score.notes)
             for grade in score.answer_grades:
+                if grade.metadata.get("skipped") is True:
+                    continue
                 if not grade.passed:
                     reasons.append(f"{grade.grader} grader: {grade.feedback or 'failed'}")
             lines.append(f"  - {score.scenario}: {'; '.join(reasons) or 'missing result'}")
@@ -100,9 +108,15 @@ def html_report(report: EvaluationReport) -> str:
         failures.extend(score.turn_violations)
         if score.notes:
             failures.append(score.notes)
+        skipped_graders = []
         for grade in score.answer_grades:
+            if grade.metadata.get("skipped") is True:
+                skipped_graders.append(grade.grader)
+                continue
             if not grade.passed:
                 failures.append(f"{grade.grader} grader: {grade.feedback or 'failed'}")
+        if skipped_graders:
+            failures.append("Skipped graders: " + ", ".join(skipped_graders))
         outcome = "Passed" if score.passed else "Failed"
         reason = "; ".join(failures) if failures else "—"
         scenario_rows.append(

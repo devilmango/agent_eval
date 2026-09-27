@@ -4,6 +4,7 @@ from pathlib import Path
 
 from agent_eval.graders import JudgeRequest, grade_answer
 from agent_eval.models import AgentResult, GradeResult, Scenario
+from agent_eval.scoring import evaluate
 
 
 class DeterministicJudge:
@@ -16,6 +17,17 @@ class DeterministicJudge:
 
 
 class SemanticJudgeTests(unittest.TestCase):
+    def test_evaluation_can_explicitly_skip_semantic_judges(self):
+        scenario = Scenario(
+            name="hours", input={"user": "When do you close?"}, intent="HOURS",
+            answer_graders=({"type": "llm_judge", "judge": "fixture", "rubric": "Check time."},),
+        )
+        report = evaluate([scenario], {"hours": AgentResult("hours", "HOURS", answer="five")},
+                          skip_semantic_judges=True)
+        self.assertTrue(report.scores[0].passed)
+        self.assertIsNone(report.answer_quality_score)
+        self.assertTrue(report.scores[0].answer_grades[0].metadata["skipped"])
+
     def test_records_rubric_model_judge_version_and_rationale(self):
         scenario = Scenario(
             name="hours", input={"user": "When do you close?"}, intent="HOURS",

@@ -13,6 +13,9 @@ from typing import Any
 from agent_eval import __version__
 from agent_eval.adapters import result_as_dict
 from agent_eval.models import AgentResult, EvaluationReport, Scenario
+from agent_eval.results import load_results
+from agent_eval.scenarios import load_scenarios
+from agent_eval.scoring import evaluate
 from agent_eval.versioning import snapshot as scenario_snapshot
 
 
@@ -124,8 +127,28 @@ def verify_bundle(root: Path) -> dict[str, Any]:
             errors.append(f"hash mismatch: {relative}")
         else:
             verified += 1
+    declared = set(manifest["files"])
+    actual = {item.relative_to(root).as_posix() for item in root.rglob("*")
+              if item.is_file() and item != manifest_path}
+    for relative in sorted(actual - declared):
+        errors.append(f"unlisted file: {relative}")
     computed_run_id = sha256(json.dumps(manifest["files"], sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     if manifest.get("run_id") != computed_run_id:
         errors.append("run id does not match file hash inventory")
     return {"valid": not errors, "run_id": manifest.get("run_id"),
             "verified_files": verified, "errors": errors}
+
+
+def replay_bundle(root: Path, *, strict: bool = False, judge_cache: Path | None = None,
+                  judge_repetitions: int = 1,
+                  skip_semantic_judges: bool = False) -> tuple[dict[str, Any], EvaluationReport]:
+    """Re-score a verified bundle's recorded scenarios and results without running an agent."""
+    verification = verify_bundle(root)
+    if not verification["valid"]:
+        raise BundleError("cannot replay invalid bundle: " + "; ".join(verification["errors"]))
+    scenarios = load_scenarios(root / "scenarios")
+    results = load_results(root / "results.jsonl")
+    report = evaluate(scenarios, results, strict=strict, judge_cache=judge_cache,
+                      judge_repetitions=judge_repetitions,
+                      skip_semantic_judges=skip_semantic_judges)
+    return verification, report

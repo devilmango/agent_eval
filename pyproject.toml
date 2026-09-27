@@ -20,9 +20,11 @@ classifiers = [
   "Programming Language :: Python :: 3.12",
 ]
 
+[project.optional-dependencies]
+signing = ["cryptography>=42.0"]
+
 [project.scripts]
 agent-eval = "agent_eval.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
-

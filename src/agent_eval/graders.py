@@ -178,6 +178,7 @@ def grade_answer(
     registry: Mapping[str, AnswerGrader],
     judges: Mapping[str, SemanticJudge] | None = None,
     *, judge_cache: Path | None = None, judge_repetitions: int = 1,
+    skip_semantic_judges: bool = False,
 ) -> tuple[GradeResult, ...]:
     if judge_repetitions < 1:
         raise GraderError("judge repetitions must be at least one")
@@ -185,6 +186,13 @@ def grade_answer(
     for spec in scenario.answer_graders:
         grader_name = spec["type"]
         if grader_name == "llm_judge":
+            if skip_semantic_judges:
+                grades.append(GradeResult(
+                    grader=grader_name, score=0.0, passed=False,
+                    feedback="Semantic judge skipped by request.", rubric=dict(spec),
+                    metadata={"skipped": True},
+                ))
+                continue
             judge_name = spec.get("judge")
             judge = (judges or {}).get(judge_name) if isinstance(judge_name, str) else None
             if judge is None:
