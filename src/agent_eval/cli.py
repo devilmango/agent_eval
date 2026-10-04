@@ -13,7 +13,8 @@ from typing import Any
 
 from agent_eval import __version__
 from agent_eval.bundles import BundleError, create_bundle, replay_bundle, verify_bundle
-from agent_eval.calibration import CalibrationError, calibrate_judge, text_calibration_report
+from agent_eval.calibration import (CalibrationError, calibrate_grounding, calibrate_judge,
+                                   text_calibration_report, text_grounding_calibration_report)
 from agent_eval.adapters import AdapterError, PathMappingAdapter, load_adapter_plugin, result_as_dict
 from agent_eval.approval_policies import ApprovalPolicyError, load_approval_policy, policy_blockers
 from agent_eval.baseline_history import (BaselineHistoryError, append_baseline_history,
@@ -38,7 +39,8 @@ from agent_eval.otel import OpenTelemetryAdapter, load_otel_document
 from agent_eval.portable_baseline import (PortableBaselineError, export_portable_baseline,
                                           import_portable_baseline)
 from agent_eval.quality import failure_analysis, mutation_report, scenario_coverage, scenario_suggestions, judge_agreement, text_coverage, text_mutation_report, text_failure_analysis
-from agent_eval.report import html_report, json_report, repeated_html_report, text_report
+from agent_eval.report import (html_report, json_report, junit_report, repeated_html_report,
+                               sarif_report, text_report)
 from agent_eval.redaction import (
     RedactionError, audit_redaction_file, load_redaction_rules,
     redact_document, text_redaction_audit,
@@ -71,7 +73,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="JSON Lines file with one agent result per scenario",
     )
-    run.add_argument("--format", choices=("text", "json", "html"), default="text")
+    run.add_argument("--format", choices=("text", "json", "html", "junit", "sarif"), default="text")
     run.add_argument("--output", type=Path, help="write the report to a file instead of stdout")
     run.add_argument("--strict", action="store_true", help="fail when any scenario result is missing")
     run.add_argument("--quiet-details", action="store_true", help="hide per-scenario failure details")
@@ -253,7 +255,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_agent.add_argument("--runner", required=True, help="runner entry-point name")
     run_agent.add_argument("--results", required=True, type=Path, help="write captured canonical JSONL results here")
     run_agent.add_argument("--report", type=Path, help="write evaluation report here (defaults to stdout)")
-    run_agent.add_argument("--format", choices=("text", "json", "html"), default="text")
+    run_agent.add_argument("--format", choices=("text", "json", "html", "junit", "sarif"), default="text")
     run_agent.add_argument("--judge-cache", type=Path, help="cache semantic judge results in this JSON file")
     run_agent.add_argument("--judge-repetitions", type=int, default=1, help="repeat semantic judgments for stability (default: 1)")
     run_agent.add_argument("--bundle-dir", type=Path, help="write a self-contained, hash-verified run bundle to a new directory")
@@ -353,6 +355,15 @@ def build_parser() -> argparse.ArgumentParser:
     calibrate.add_argument("--format", choices=("text", "json"), default="text")
     calibrate.add_argument("--output", type=Path)
 
+    calibrate_ground = commands.add_parser(
+        "calibrate-grounding", help="measure evidence-grounding checks against human-reviewed examples",
+    )
+    calibrate_ground.add_argument("gold_set", type=Path, help="human-reviewed evidence-grounding YAML gold set")
+    calibrate_ground.add_argument("--min-accuracy", type=float,
+                                  help="fail unless accuracy over reviewed examples reaches this threshold")
+    calibrate_ground.add_argument("--format", choices=("text", "json"), default="text")
+    calibrate_ground.add_argument("--output", type=Path)
+
     verify = commands.add_parser("verify-bundle", help="check hashes and integrity of a run artifact bundle")
     verify.add_argument("bundle", type=Path)
     verify.add_argument("--format", choices=("text", "json"), default="text")
@@ -363,7 +374,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="re-score a verified bundle without running its agent (semantic judge plugins may make provider calls)",
     )
     replay.add_argument("bundle", type=Path, help="self-contained evaluation bundle")
-    replay.add_argument("--format", choices=("text", "json", "html"), default="text")
+    replay.add_argument("--format", choices=("text", "json", "html", "junit", "sarif"), default="text")
     replay.add_argument("--output", type=Path, help="write the fresh report instead of stdout")
     replay.add_argument("--strict", action="store_true", help="fail when a bundle is missing scenario results")
     replay.add_argument("--judge-cache", type=Path, help="cache semantic judge results in this JSON file")
@@ -460,6 +471,10 @@ def main(argv: list[str] | None = None) -> int:
                 rendered = json_report(report)
             elif args.format == "html":
                 rendered = html_report(report)
+            elif args.format == "junit":
+                rendered = junit_report(report)
+            elif args.format == "sarif":
+                rendered = sarif_report(report)
             else:
                 rendered = f"Replayed bundle {verification['run_id']}\n\n{text_report(report)}"
             _write_output(args.output, rendered)
@@ -480,6 +495,13 @@ def main(argv: list[str] | None = None) -> int:
                 threshold=args.threshold, min_accuracy=args.min_accuracy,
             )
             rendered = json.dumps(report, indent=2, ensure_ascii=False) if args.format == "json" else text_calibration_report(report)
+            _write_output(args.output, rendered)
+            return 0 if report["passed_gate"] else 1
+
+        if args.command == "calibrate-grounding":
+            report = calibrate_grounding(args.gold_set, min_accuracy=args.min_accuracy)
+            rendered = (json.dumps(report, indent=2, ensure_ascii=False) if args.format == "json"
+                        else text_grounding_calibration_report(report))
             _write_output(args.output, rendered)
             return 0 if report["passed_gate"] else 1
 
@@ -1098,6 +1120,10 @@ def main(argv: list[str] | None = None) -> int:
                 rendered = json_report(report)
             elif args.format == "html":
                 rendered = html_report(report)
+            elif args.format == "junit":
+                rendered = junit_report(report)
+            elif args.format == "sarif":
+                rendered = sarif_report(report)
             else:
                 rendered = text_report(report)
             _write_output(args.report, rendered)
@@ -1128,6 +1154,10 @@ def main(argv: list[str] | None = None) -> int:
         rendered = json_report(report)
     elif args.format == "html":
         rendered = html_report(report)
+    elif args.format == "junit":
+        rendered = junit_report(report)
+    elif args.format == "sarif":
+        rendered = sarif_report(report)
     else:
         rendered = text_report(report, details=not args.quiet_details)
     _write_output(args.output, rendered)

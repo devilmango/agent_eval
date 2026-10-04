@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import xml.etree.ElementTree as ET
 from html import escape
 
 from agent_eval.models import EvaluationReport
@@ -69,6 +70,122 @@ def text_report(report: EvaluationReport, *, details: bool = True) -> str:
 
 def json_report(report: EvaluationReport) -> str:
     return json.dumps(report.as_dict(), indent=2, ensure_ascii=False)
+
+
+def junit_report(report: EvaluationReport) -> str:
+    """Render one JUnit testcase per scenario for common CI test publishers."""
+    failed = sum(not score.passed for score in report.scores)
+    skipped = sum(1 for score in report.scores if score.passed and _skipped_graders(score))
+    suite = ET.Element("testsuite", {
+        "name": "agent-eval",
+        "tests": str(report.total),
+        "failures": str(failed),
+        "errors": "0",
+        "skipped": str(skipped),
+        "time": "0",
+    })
+    properties = ET.SubElement(suite, "properties")
+    metrics = {
+        "intent_accuracy": report.intent_accuracy,
+        "tool_accuracy": report.tool_accuracy,
+        "policy_compliance": report.policy_compliance,
+        "unnecessary_question_rate": report.unnecessary_question_rate,
+        "answer_quality_score": report.answer_quality_score,
+    }
+    for name, value in metrics.items():
+        if value is not None:
+            ET.SubElement(properties, "property", {"name": name, "value": str(value)})
+    for score in report.scores:
+        case = ET.SubElement(suite, "testcase", {
+            "classname": "agent_eval.scenarios",
+            "name": score.scenario,
+            "time": "0",
+        })
+        reasons = _scenario_failure_reasons(score)
+        if not score.passed:
+            failure = ET.SubElement(case, "failure", {
+                "type": "ScenarioFailure",
+                "message": "; ".join(reasons) or "scenario did not pass",
+            })
+            failure.text = "\n".join(reasons)
+        elif _skipped_graders(score):
+            ET.SubElement(case, "skipped", {
+                "message": "Semantic grader(s) skipped: " + ", ".join(_skipped_graders(score)),
+            })
+    return ET.tostring(suite, encoding="unicode", xml_declaration=True)
+
+
+def sarif_report(report: EvaluationReport) -> str:
+    """Render failed scenarios as SARIF 2.1.0 results for code-scanning consumers."""
+    rule_id = "agent-eval/scenario-failed"
+    results = []
+    for score in report.scores:
+        if score.passed:
+            continue
+        results.append({
+            "ruleId": rule_id,
+            "ruleIndex": 0,
+            "level": "error",
+            "message": {"text": "; ".join(_scenario_failure_reasons(score)) or "scenario did not pass"},
+            "locations": [{
+                "logicalLocations": [{"name": score.scenario}],
+            }],
+            "properties": {
+                "scenario": score.scenario,
+                "expectedIntent": score.expected_intent,
+                "actualIntent": score.actual_intent,
+                "missingQuestions": list(score.missing_questions),
+                "policyViolations": list(score.policy_violations),
+            },
+        })
+    document = {
+        "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+        "version": "2.1.0",
+        "runs": [{
+            "tool": {"driver": {
+                "name": "Agent Eval",
+                "informationUri": "https://github.com/devilmango/agent_eval",
+                "rules": [{
+                    "id": rule_id,
+                    "shortDescription": {"text": "Agent scenario did not satisfy its expectations"},
+                    "fullDescription": {"text": "A recorded agent result failed one or more scenario checks."},
+                    "defaultConfiguration": {"level": "error"},
+                    "properties": {"tags": ["ai-reliability", "agent-evaluation"]},
+                }],
+            }},
+            "results": results,
+            "properties": {"scenarioCount": report.total, "passed": report.passed,
+                           "failed": report.failed},
+        }],
+    }
+    return json.dumps(document, indent=2, ensure_ascii=False)
+
+
+def _scenario_failure_reasons(score) -> list[str]:
+    reasons = []
+    if not score.intent_correct:
+        reasons.append(f"intent {score.actual_intent!r}; expected {score.expected_intent!r}")
+    if score.missing_questions:
+        reasons.append("missing questions: " + ", ".join(score.missing_questions))
+    if score.unnecessary_questions:
+        reasons.append("unnecessary questions: " + ", ".join(score.unnecessary_questions))
+    if score.tool_correct is False:
+        reasons.extend(score.tool_call_mismatches or ("tool set differs from expected",))
+    if score.policy_violations:
+        reasons.append("policy violations: " + ", ".join(score.policy_violations))
+    reasons.extend(score.turn_violations)
+    if score.notes:
+        reasons.append(score.notes)
+    for grade in score.answer_grades:
+        if grade.metadata.get("skipped") is True:
+            continue
+        if not grade.passed:
+            reasons.append(f"{grade.grader} grader: {grade.feedback or 'failed'}")
+    return reasons
+
+
+def _skipped_graders(score) -> list[str]:
+    return [grade.grader for grade in score.answer_grades if grade.metadata.get("skipped") is True]
 
 
 def html_report(report: EvaluationReport) -> str:

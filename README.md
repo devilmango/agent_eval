@@ -16,6 +16,7 @@ The core package has no model-provider or agent-framework dependency. Optional r
 - **Scenario pass rate** — did each scenario satisfy all of its declared checks?
 - **Run-to-run stability** — how consistent are those scores across repeated agent executions?
 - **HTML reports** — can reviewers inspect a run or repeated-run analysis in a browser?
+- **CI report exports** — publish scenario results as JUnit XML or SARIF 2.1.0 in test reporting and code-scanning pipelines.
 - **Multi-turn conversations** — can expectations be checked across turns while preserving order?
 - **Coverage and mutation audits** — which behavior dimensions have scenarios, and do those scenarios catch representative regressions?
 - **Framework adapters** — built-in normalizers for OpenAI Agents SDK spans and LangChain event/run records, alongside OpenTelemetry and custom adapters.
@@ -27,6 +28,7 @@ The core package has no model-provider or agent-framework dependency. Optional r
 - **Failure triage and slices** — group regressions by cause and compare pass rates by intent, tag, model, and prompt version.
 - **Execution budgets** — gate total cost/tokens and p95 scenario latency in local runs or CI.
 - **Gold-set judge calibration** — measure semantic judge accuracy against human-labeled cases, including precision, recall, F1, and score calibration.
+- **Evidence-grounding checks** — verify answer-token overlap against supplied evidence, enforce citations, and measure results against human-reviewed examples.
 - **Reproducible run bundles** — package evaluated scenarios, results, reports, settings, and integrity hashes for later review or replay.
 - **Bundle replay** — re-score recorded scenarios and results with the current evaluator without starting the agent runner.
 - **Pull request annotations** — surface scenario regressions as GitHub Actions annotations and add a metric comparison to the job summary.
@@ -402,6 +404,15 @@ Write a machine-readable report for CI artifacts or another reporting tool:
 agent-eval run scenarios/ --responses run.jsonl --format json > report.json
 ```
 
+JUnit XML and SARIF 2.1.0 exports are also available for `run`, `run-agent`, and `replay-bundle`:
+
+```bash
+agent-eval run scenarios/ --responses run.jsonl --format junit --output test-results.xml
+agent-eval run scenarios/ --responses run.jsonl --format sarif --output agent-eval.sarif
+```
+
+JUnit emits one testcase per scenario, including failure details and skipped semantic graders. SARIF reports failed scenarios as error-level findings with their scenario IDs as logical locations. Upload the SARIF file with the code-scanning action supported by your CI platform; existing `--github-annotations` options remain available for inline GitHub workflow annotations.
+
 Use `--strict` to return an input error when any scenario result is missing. Without it, missing results appear as failed scenarios in the report. Unknown and duplicate scenario IDs in the result file are always input errors. Use `--quiet-details` to print only the text summary.
 
 Set execution budgets to fail the run when a measured limit is exceeded or a requested metric is absent:
@@ -678,7 +689,30 @@ expected:
       values: ["patient record"]
 ```
 
-Built-in grader types are `contains_any`, `contains_all`, `not_contains`, `min_length`, and `max_length`. Text graders accept `case_sensitive` (default `false`); `contains_any` and `contains_all` can accept a `threshold` from 0 to 1. Length graders take a non-negative integer `value`. These are deterministic checks, not semantic truth or clinical safety assessments.
+Built-in grader types are `contains_any`, `contains_all`, `not_contains`, `min_length`, `max_length`, and `evidence_grounded`. Text graders accept `case_sensitive` (default `false`); `contains_any` and `contains_all` can accept a `threshold` from 0 to 1. Length graders take a non-negative integer `value`. These are deterministic checks, not semantic truth or clinical safety assessments.
+
+`evidence_grounded` checks every answer sentence against source text declared with the grader, validates `[source-id]` citations, and fails unsupported or uncited content. By default each sentence must cite a known source; set `require_citations: false` to only check lexical support. `min_supported_token_ratio` (default `0.8`) sets the minimum fraction of meaningful answer tokens that must appear in the applicable evidence. The check is an exact-token heuristic, so it does not establish semantic entailment; tune and measure it against reviewed examples:
+
+```yaml
+expected:
+  intent: OFFICE_HOURS
+  answer_graders:
+    - type: evidence_grounded
+      require_citations: true
+      min_supported_token_ratio: 0.9
+      evidence:
+        - id: clinic-hours
+          text: "The clinic opens at 9 AM and closes at 5 PM."
+```
+
+The answer must cite evidence with the configured ID, for example: `The clinic closes at 5 PM. [clinic-hours]`. Human-reviewed calibration files record `reviewed_by`, `reviewed_at`, per-case evidence, and `expected_passed`. Run the included set or calibrate your own:
+
+```bash
+agent-eval calibrate-grounding examples/evidence-grounding-gold.yaml \
+  --min-accuracy 1.0 --format json --output grounding-calibration.json
+```
+
+Calibration reports accuracy, precision, recall, F1, a confusion matrix, and disagreements. It measures this deterministic check against the labels; it does not learn a new model or choose a threshold automatically. The checked-in [example gold set](examples/evidence-grounding-gold.yaml) demonstrates the format. Its reviewer metadata is illustrative; have a human review the evidence and expected labels in your own gold set before using calibration results as a release gate.
 
 Custom graders can be installed as Python entry points in the `agent_eval.graders` group. Each entry-point name is the scenario's `type`; its loaded class/factory/object must expose `grade(answer: str, config: Mapping[str, Any]) -> GradeResult`. The `GradeResult` contains a normalized `score` from 0 to 1, `passed`, optional `feedback`, and optional `metadata`. Grader packages run in-process and should be treated as trusted code.
 

@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from hashlib import sha256
 from importlib.metadata import entry_points
 import json
+from math import isfinite
+import re
 from typing import Any, Protocol
 from pathlib import Path
 from statistics import mean, pstdev
@@ -94,6 +96,106 @@ class _MaxLength:
                        f"Answer length {len(answer)}; maximum {maximum}")
 
 
+class _EvidenceGrounded:
+    """Check lexical support for each answer sentence and validate source citations."""
+
+    _citation = re.compile(r"\[([A-Za-z0-9_.:-]+)\]")
+    _stop_words = {
+        "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "in",
+        "is", "it", "of", "on", "or", "that", "the", "this", "to", "was", "were",
+        "will", "with",
+    }
+
+    def grade(self, answer: str, config: Mapping[str, Any]) -> GradeResult:
+        evidence = self._evidence(config.get("evidence"))
+        require_citations = config.get("require_citations", True)
+        if not isinstance(require_citations, bool):
+            raise GraderError("evidence_grounded 'require_citations' must be a boolean")
+        minimum = config.get("min_supported_token_ratio", 0.8)
+        if (isinstance(minimum, bool) or not isinstance(minimum, (int, float))
+                or not isfinite(minimum) or not 0 <= minimum <= 1):
+            raise GraderError("evidence_grounded 'min_supported_token_ratio' must be between 0 and 1")
+        if not isinstance(answer, str):
+            raise GraderError("evidence_grounded answer must be a string")
+
+        answer = re.sub(r"([.!?])\s*(\[[A-Za-z0-9_.:-]+\])", r"\2\1", answer.strip())
+        sentences = [sentence for sentence in re.split(r"(?<=[.!?])\s+", answer) if sentence.strip()]
+        supported_count = 0
+        token_count = 0
+        unsupported: list[str] = []
+        citations: list[str] = []
+        unknown: list[str] = []
+        missing_citations = 0
+        for sentence in sentences:
+            sentence_citations = self._citation.findall(sentence)
+            citations.extend(sentence_citations)
+            unknown.extend(citation for citation in sentence_citations if citation not in evidence)
+            if require_citations and not sentence_citations:
+                missing_citations += 1
+            cited_evidence = ([evidence[item] for item in sentence_citations if item in evidence]
+                              if sentence_citations else list(evidence.values()))
+            source_tokens = {token for text in cited_evidence for token in self._tokens(text)}
+            answer_tokens = self._tokens(self._citation.sub("", sentence))
+            token_count += len(answer_tokens)
+            for token in answer_tokens:
+                if token in source_tokens:
+                    supported_count += 1
+                else:
+                    unsupported.append(token)
+
+        ratio = supported_count / token_count if token_count else 0.0
+        citation_valid = not unknown and (not require_citations or missing_citations == 0)
+        passed = bool(sentences) and ratio >= float(minimum) and citation_valid
+        score = ratio if citation_valid else 0.0
+        feedback = f"Supported {supported_count}/{token_count} meaningful answer tokens."
+        if unsupported:
+            feedback += " Unsupported tokens: " + ", ".join(unsupported) + "."
+        if missing_citations:
+            feedback += f" {missing_citations} sentence(s) lack citations."
+        if unknown:
+            feedback += " Unknown citation(s): " + ", ".join(dict.fromkeys(unknown)) + "."
+        return GradeResult(
+            grader="evidence_grounded", score=score, passed=passed,
+            feedback=feedback, rubric=dict(config), metadata={
+                "supported_tokens": supported_count,
+                "answer_tokens": token_count,
+                "supported_token_ratio": ratio,
+                "unsupported_tokens": unsupported,
+                "citations": citations,
+                "unknown_citations": list(dict.fromkeys(unknown)),
+                "uncited_sentences": missing_citations,
+                "minimum_supported_token_ratio": float(minimum),
+            },
+        )
+
+    @staticmethod
+    def _tokens(text: str) -> list[str]:
+        tokens = re.findall(r"[^\W_]+(?:['’][^\W_]+)?", text.casefold())
+        return [token for token in tokens if token not in _EvidenceGrounded._stop_words]
+
+    @staticmethod
+    def _evidence(value: Any) -> dict[str, str]:
+        if isinstance(value, dict):
+            entries = [{"id": key, "text": text} for key, text in value.items()]
+        elif isinstance(value, list):
+            entries = value
+        else:
+            raise GraderError("evidence_grounded requires non-empty 'evidence' entries")
+        evidence: dict[str, str] = {}
+        for index, entry in enumerate(entries):
+            if (not isinstance(entry, dict) or not isinstance(entry.get("id"), str)
+                    or not entry["id"].strip() or not isinstance(entry.get("text"), str)
+                    or not entry["text"].strip()):
+                raise GraderError(f"evidence_grounded evidence[{index}] needs non-empty 'id' and 'text'")
+            source_id = entry["id"].strip()
+            if source_id in evidence:
+                raise GraderError(f"evidence_grounded evidence IDs must be unique: {source_id}")
+            evidence[source_id] = entry["text"]
+        if not evidence:
+            raise GraderError("evidence_grounded requires non-empty 'evidence' entries")
+        return evidence
+
+
 def _string_values(config: Mapping[str, Any]) -> list[str]:
     values = config.get("values")
     if not isinstance(values, list) or not values or any(not isinstance(value, str) for value in values):
@@ -131,6 +233,7 @@ def load_grader_registry() -> dict[str, AnswerGrader]:
         "not_contains": _NotContains(),
         "min_length": _MinLength(),
         "max_length": _MaxLength(),
+        "evidence_grounded": _EvidenceGrounded(),
     }
     points = entry_points()
     if hasattr(points, "select"):
