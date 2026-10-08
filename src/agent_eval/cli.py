@@ -45,6 +45,7 @@ from agent_eval.redaction import (
     RedactionError, audit_redaction_file, load_redaction_rules,
     redact_document, text_redaction_audit,
 )
+from agent_eval.robustness import VARIANT_TYPES, run_robustness
 from agent_eval.repeated import analyze_repeated_runs, text_repeated_report
 from agent_eval.results import ResultError, load_results
 from agent_eval.runner import RunnerError, execute_scenarios, load_runner
@@ -361,8 +362,20 @@ def build_parser() -> argparse.ArgumentParser:
     calibrate_ground.add_argument("gold_set", type=Path, help="human-reviewed evidence-grounding YAML gold set")
     calibrate_ground.add_argument("--min-accuracy", type=float,
                                   help="fail unless accuracy over reviewed examples reaches this threshold")
+    calibrate_ground.add_argument("--judge", help="optional semantic judge plugin; compares entailment with lexical results")
     calibrate_ground.add_argument("--format", choices=("text", "json"), default="text")
     calibrate_ground.add_argument("--output", type=Path)
+
+    robustness = commands.add_parser(
+        "robustness", help="run controlled input and tool-result perturbations against an agent",
+    )
+    robustness.add_argument("scenarios", type=Path, help="scenario YAML file or directory")
+    robustness.add_argument("--runner", required=True, help="installed agent runner plugin")
+    robustness.add_argument("--type", action="append", choices=(
+        "paraphrase", "typo", "ambiguous", "prompt_injection", "conflicting_tool_results",
+    ), help="variant type to run (repeatable; defaults to all types)")
+    robustness.add_argument("--format", choices=("text", "json"), default="text")
+    robustness.add_argument("--output", type=Path)
 
     verify = commands.add_parser("verify-bundle", help="check hashes and integrity of a run artifact bundle")
     verify.add_argument("bundle", type=Path)
@@ -499,7 +512,11 @@ def main(argv: list[str] | None = None) -> int:
             return 0 if report["passed_gate"] else 1
 
         if args.command == "calibrate-grounding":
-            report = calibrate_grounding(args.gold_set, min_accuracy=args.min_accuracy)
+            report = calibrate_grounding(
+                args.gold_set, min_accuracy=args.min_accuracy,
+                judge_name=args.judge,
+                judges=load_judge_registry() if args.judge else None,
+            )
             rendered = (json.dumps(report, indent=2, ensure_ascii=False) if args.format == "json"
                         else text_grounding_calibration_report(report))
             _write_output(args.output, rendered)
@@ -683,6 +700,25 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         all_scenarios = load_scenarios(args.scenarios) if hasattr(args, "scenarios") else []
+        if args.command == "robustness":
+            report = run_robustness(
+                all_scenarios, load_runner(args.runner), types=args.type or VARIANT_TYPES,
+            )
+            if args.format == "json":
+                rendered = json.dumps(report, indent=2, ensure_ascii=False)
+            else:
+                lines = [f"Robustness suite: {report['scenario_count']} scenarios, "
+                         f"{report['variant_count']} variants",
+                         f"Unexpected changes: {report['unexpected_changes']}",
+                         f"Skipped variants: {len(report['skipped_variants'])}"]
+                for row in report["variants"]:
+                    lines.append(f"  {'FAIL' if row['unexpected'] else 'PASS'} "
+                                 f"{row['scenario']} [{row['variant']}]: "
+                                 f"{', '.join(row['changed_fields']) or 'behavior unchanged'}")
+                    lines.extend("    " + reason for reason in row["reasons"])
+                rendered = "\n".join(lines)
+            _write_output(args.output, rendered)
+            return 0 if report["passed"] else 1
         if args.command == "scenario-audit":
             audit_date = date.fromisoformat(args.as_of) if args.as_of else None
             report = audit_scenarios(

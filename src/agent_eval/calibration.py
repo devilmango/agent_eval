@@ -8,20 +8,24 @@ import json
 from math import isfinite
 from pathlib import Path
 from statistics import mean
-from typing import Any
+from typing import Any, Mapping
 
 import yaml
 
-from agent_eval.graders import GraderError, JudgeRequest, SemanticJudge, load_grader_registry
-from agent_eval.models import GradeResult
+from agent_eval.graders import (GraderError, JudgeRequest, SemanticJudge, grade_answer,
+                                load_grader_registry)
+from agent_eval.models import AgentResult, GradeResult, Scenario
 
 
 class CalibrationError(ValueError):
     """Raised when a gold set is invalid or judge output is malformed."""
 
 
-def calibrate_grounding(path: Path, *, min_accuracy: float | None = None) -> dict[str, Any]:
-    """Measure the deterministic evidence grader against human-reviewed examples."""
+def calibrate_grounding(
+    path: Path, *, min_accuracy: float | None = None, judge_name: str | None = None,
+    judges: Mapping[str, SemanticJudge] | None = None,
+) -> dict[str, Any]:
+    """Measure lexical grounding and optional semantic entailment on the same labels."""
     if min_accuracy is not None and (
         isinstance(min_accuracy, bool) or not isinstance(min_accuracy, (int, float))
         or not isfinite(min_accuracy) or not 0 <= min_accuracy <= 1
@@ -57,6 +61,7 @@ def calibrate_grounding(path: Path, *, min_accuracy: float | None = None) -> dic
 
     rows: list[dict[str, Any]] = []
     tp = tn = fp = fn = 0
+    semantic_tp = semantic_tn = semantic_fp = semantic_fn = 0
     seen: set[str] = set()
     for index, case in enumerate(cases, start=1):
         label = f"cases[{index - 1}]"
@@ -90,12 +95,59 @@ def calibrate_grounding(path: Path, *, min_accuracy: float | None = None) -> dic
         rows.append({"id": case_id, "expected_passed": expected_pass,
                      "predicted_passed": predicted, "score": output.score,
                      "feedback": output.feedback, "metadata": output.metadata})
+        if judge_name is not None:
+            semantic_scenario = Scenario(
+                name=case_id, input={"user": "Calibration example"}, intent="CALIBRATION",
+                answer_graders=({
+                    "type": "evidence_entailment", "judge": judge_name,
+                    "evidence": evidence, "require_citations": grader_config.get("require_citations", True),
+                    "threshold": grader_config.get("semantic_threshold", 0.7),
+                },),
+            )
+            try:
+                semantic_grade = grade_answer(
+                    semantic_scenario,
+                    AgentResult(scenario=case_id, intent="CALIBRATION", answer=answer),
+                    {"evidence_grounded": grader}, judges,
+                )[0]
+            except GraderError as exc:
+                raise CalibrationError(
+                    f"semantic evidence calibration failed for {case_id!r}: {exc}"
+                ) from exc
+            semantic_predicted = semantic_grade.passed
+            if expected_pass and semantic_predicted:
+                semantic_tp += 1
+            elif expected_pass:
+                semantic_fn += 1
+            elif semantic_predicted:
+                semantic_fp += 1
+            else:
+                semantic_tn += 1
+            rows[-1]["semantic_predicted_passed"] = semantic_predicted
+            rows[-1]["semantic_score"] = semantic_grade.score
+            rows[-1]["semantic_feedback"] = semantic_grade.feedback
 
     count = len(rows)
     accuracy = (tp + tn) / count
     precision = tp / (tp + fp) if tp + fp else 0.0
     recall = tp / (tp + fn) if tp + fn else 0.0
     f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
+    semantic_comparison = None
+    semantic_accuracy: float | None = None
+    if judge_name is not None:
+        semantic_accuracy = (semantic_tp + semantic_tn) / count
+        semantic_precision = semantic_tp / (semantic_tp + semantic_fp) if semantic_tp + semantic_fp else 0.0
+        semantic_recall = semantic_tp / (semantic_tp + semantic_fn) if semantic_tp + semantic_fn else 0.0
+        semantic_f1 = (2 * semantic_precision * semantic_recall / (semantic_precision + semantic_recall)
+                       if semantic_precision + semantic_recall else 0.0)
+        semantic_comparison = {
+            "judge": judge_name,
+            "confusion_matrix": {"true_positive": semantic_tp, "true_negative": semantic_tn,
+                                 "false_positive": semantic_fp, "false_negative": semantic_fn},
+            "accuracy": semantic_accuracy, "precision": semantic_precision,
+            "recall": semantic_recall, "f1": semantic_f1,
+            "accuracy_delta_vs_lexical": semantic_accuracy - accuracy,
+        }
     return {
         "gold_set": document.get("gold_set", path.stem),
         "gold_set_sha256": sha256(raw).hexdigest(),
@@ -111,8 +163,10 @@ def calibrate_grounding(path: Path, *, min_accuracy: float | None = None) -> dic
         "precision": precision,
         "recall": recall,
         "f1": f1,
+        "semantic_comparison": semantic_comparison,
         "minimum_accuracy": min_accuracy,
-        "passed_gate": min_accuracy is None or accuracy >= min_accuracy,
+        "passed_gate": (min_accuracy is None or accuracy >= min_accuracy)
+        and (min_accuracy is None or semantic_accuracy is None or semantic_accuracy >= min_accuracy),
         "results": rows,
     }
 
@@ -130,6 +184,12 @@ def text_grounding_calibration_report(report: dict[str, Any]) -> str:
         f"FP {matrix['false_positive']}, FN {matrix['false_negative']}",
         "Gate: " + ("PASS" if report["passed_gate"] else "FAIL"),
     ]
+    semantic = report.get("semantic_comparison")
+    if semantic:
+        lines.extend([
+            f"Semantic entailment ({semantic['judge']}) accuracy: {semantic['accuracy'] * 100:.1f}%",
+            f"Accuracy delta vs lexical baseline: {semantic['accuracy_delta_vs_lexical'] * 100:+.1f} pp",
+        ])
     for row in report["results"]:
         if row["expected_passed"] != row["predicted_passed"]:
             lines.append(f"  DISAGREEMENT {row['id']}: expected {row['expected_passed']}, "

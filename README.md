@@ -29,6 +29,9 @@ The core package has no model-provider or agent-framework dependency. Optional r
 - **Execution budgets** — gate total cost/tokens and p95 scenario latency in local runs or CI.
 - **Gold-set judge calibration** — measure semantic judge accuracy against human-labeled cases, including precision, recall, F1, and score calibration.
 - **Evidence-grounding checks** — verify answer-token overlap against supplied evidence, enforce citations, and measure results against human-reviewed examples.
+- **Semantic evidence entailment** — optionally ask a configured semantic judge to check cited answer claims for paraphrase support, contradictions, and unsupported additions alongside the lexical baseline.
+- **Robustness suites** — run deterministic paraphrase, typo, ambiguity, prompt-injection, and conflicting-tool-result variants and report unexpected behavior changes.
+- **Privacy and action safety** — detect common PII patterns and configured secret disclosures, check refusal expectations, and require confirmation before consequential actions.
 - **Reproducible run bundles** — package evaluated scenarios, results, reports, settings, and integrity hashes for later review or replay.
 - **Bundle replay** — re-score recorded scenarios and results with the current evaluator without starting the agent runner.
 - **Pull request annotations** — surface scenario regressions as GitHub Actions annotations and add a metric comparison to the job summary.
@@ -713,6 +716,69 @@ agent-eval calibrate-grounding examples/evidence-grounding-gold.yaml \
 ```
 
 Calibration reports accuracy, precision, recall, F1, a confusion matrix, and disagreements. It measures this deterministic check against the labels; it does not learn a new model or choose a threshold automatically. The checked-in [example gold set](examples/evidence-grounding-gold.yaml) demonstrates the format. Its reviewer metadata is illustrative; have a human review the evidence and expected labels in your own gold set before using calibration results as a release gate.
+
+For semantic entailment, add an `evidence_entailment` grader to the scenario and configure a semantic judge plugin. The judge is called once per answer claim with only the cited evidence, and its rubric asks it to accept faithful paraphrases while rejecting contradictions and extra claims:
+
+```yaml
+expected:
+  answer_graders:
+    - type: evidence_grounded # fast lexical baseline
+      evidence:
+        - id: clinic-hours
+          text: "The clinic closes at 5 PM."
+    - type: evidence_entailment # optional semantic check
+      judge: entailment-reviewer
+      threshold: 0.8
+      evidence:
+        - id: clinic-hours
+          text: "The clinic closes at 5 PM."
+```
+
+Run lexical and semantic checks against the same labeled cases to compare accuracy and per-case disagreements:
+
+```bash
+agent-eval calibrate-grounding examples/evidence-entailment-gold.yaml \
+  --judge entailment-reviewer --format json --output evidence-comparison.json
+```
+
+The semantic judge is optional and comes from the `agent_eval.judges` plugin group. Its calls can use external model services depending on the plugin. The checked-in entailment gold set is illustrative; have a human verify its labels and evidence before using it as a release gate.
+
+### Robustness and adversarial suites
+
+Use an installed runner plugin to execute each original scenario and deterministic variants. The default suite includes a paraphrase, typo, added ambiguity, prompt injection, and conflicting tool results:
+
+```bash
+agent-eval robustness scenarios/ --runner my-agent --format json \
+  --output robustness-report.json
+```
+
+Paraphrases, typos, and prompt injections are expected to preserve intent and tool/action selection. The ambiguity variant should elicit an additional clarifying question. Conflicting tool results are checked against each scenario's `must_not` rules; scenarios without tool fixtures are reported as skipped for that variant. Select variants with repeatable `--type` flags. Each variant runs the agent, so account for runner latency and provider cost.
+
+### Privacy, refusals, and consequential actions
+
+Built-in answer graders include `pii_leakage` (email, phone, and SSN patterns by default), `secret_leakage` (configured exact secret values), and `safe_refusal` (checks expected refusal or expected answer behavior). Use synthetic canary values for `secret_leakage`; configured values are omitted from grader output, but scenario files and run bundles still contain their source configuration. Configure categories or refusal phrases when the default patterns do not fit your product:
+
+```yaml
+expected:
+  answer_graders:
+    - type: pii_leakage
+      categories: [email, phone]
+    - type: secret_leakage
+      secrets: ["test-only-token"]
+    - type: safe_refusal
+      expected_refusal: true
+```
+
+For an action that requires explicit confirmation, use a conditional `must_not` policy. Agent Eval requires the confirmation question to occur before the action in the recorded event trace:
+
+```yaml
+must_not:
+  - action: transfer_funds
+    unless:
+      asked: [confirmation]
+```
+
+Runnable examples for privacy, refusal, and confirmation checks are in [examples/safety](examples/safety). PII detection is pattern-based and should be extended for domain-specific identifiers; it does not establish that an answer is free of all sensitive information.
 
 Custom graders can be installed as Python entry points in the `agent_eval.graders` group. Each entry-point name is the scenario's `type`; its loaded class/factory/object must expose `grade(answer: str, config: Mapping[str, Any]) -> GradeResult`. The `GradeResult` contains a normalized `score` from 0 to 1, `passed`, optional `feedback`, and optional `metadata`. Grader packages run in-process and should be treated as trusted code.
 

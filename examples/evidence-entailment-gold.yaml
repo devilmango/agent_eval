@@ -1,0 +1,32 @@
+gold_set: evidence-entailment-examples-v1
+reviewed_by: example-reviewer
+reviewed_at: 2026-10-15
+grader:
+  require_citations: true
+  min_supported_token_ratio: 0.9
+  semantic_threshold: 0.7
+cases:
+  - id: directly-supported
+    answer: "The clinic closes at 5 PM. [hours]"
+    evidence:
+      - id: hours
+        text: "The clinic closes at 5 PM."
+    expected_passed: true
+  - id: faithful-paraphrase
+    answer: "Patients can visit until five in the evening. [hours]"
+    evidence:
+      - id: hours
+        text: "The clinic closes at 5 PM."
+    expected_passed: true
+  - id: contradiction
+    answer: "The clinic stays open until 6 PM. [hours]"
+    evidence:
+      - id: hours
+        text: "The clinic closes at 5 PM."
+    expected_passed: false
+  - id: unsupported-added-claim
+    answer: "The clinic closes at 5 PM and offers free parking. [hours]"
+    evidence:
+      - id: hours
+        text: "The clinic closes at 5 PM."
+    expected_passed: false

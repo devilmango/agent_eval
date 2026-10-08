@@ -6,7 +6,8 @@ from collections.abc import Iterable
 from statistics import mean
 from pathlib import Path
 
-from agent_eval.graders import AnswerGrader, SemanticJudge, grade_answer, load_grader_registry, load_judge_registry
+from agent_eval.graders import (AnswerGrader, SemanticJudge, grade_answer, load_grader_registry,
+                                load_judge_registry, public_grader_rubric)
 from agent_eval.models import AgentResult, EvaluationReport, GradeResult, Scenario, ScenarioScore, ToolCallExpectation
 from agent_eval.results import ResultError
 
@@ -240,7 +241,8 @@ def evaluate(
     judge_registry = (
         load_judge_registry()
         if not skip_semantic_judges
-        and any(spec.get("type") == "llm_judge" for scenario in scenarios for spec in scenario.answer_graders)
+        and any(spec.get("type") in {"llm_judge", "evidence_entailment"}
+                for scenario in scenarios for spec in scenario.answer_graders)
         else {}
     )
 
@@ -272,7 +274,7 @@ def evaluate(
                             score=0.0,
                             passed=False,
                             feedback="No agent result was provided.",
-                            rubric=dict(spec),
+                            rubric=public_grader_rubric(spec),
                         )
                         for spec in scenario.answer_graders
                     ),
