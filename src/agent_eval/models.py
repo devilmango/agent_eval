@@ -86,6 +86,19 @@ class Scenario:
 
 
 @dataclass(frozen=True)
+class FailureDiagnostic:
+    category: str
+    message: str
+    turn_index: int | None = None
+    tool_call_index: int | None = None
+    event_index: int | None = None
+    citation_ids: tuple[str, ...] = ()
+    evidence_sources: tuple[str, ...] = ()
+    expected: Any = None
+    actual: Any = None
+
+
+@dataclass(frozen=True)
 class AgentResult:
     scenario: str
     intent: str
@@ -117,9 +130,12 @@ class ScenarioScore:
     answer_grades: tuple[GradeResult, ...] = ()
     turn_violations: tuple[str, ...] = ()
     notes: str = ""
+    diagnostics: tuple[FailureDiagnostic, ...] = ()
 
     def as_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        value = asdict(self)
+        value["first_divergence"] = asdict(self.diagnostics[0]) if self.diagnostics else None
+        return value
 
 
 @dataclass(frozen=True)

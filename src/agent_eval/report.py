@@ -34,6 +34,16 @@ def text_report(report: EvaluationReport, *, details: bool = True) -> str:
     )
     if skipped_grades:
         lines.extend(["", f"Semantic judge grades skipped: {skipped_grades}"])
+    agent_execution = report.execution.get("agent_execution")
+    if agent_execution:
+        lines.extend([
+            "", "Agent execution:",
+            f"  Scenarios: {agent_execution.get('requested', 0)} requested, "
+            f"{agent_execution.get('executed', 0)} executed, "
+            f"{agent_execution.get('reused', 0)} reused, "
+            f"{agent_execution.get('failed', 0)} failed",
+            f"  Workers: {agent_execution.get('workers', 1)}",
+        ])
     if budget_gates:
         lines.extend(["", "Execution budgets:"])
         for name, gate in budget_gates.items():
@@ -64,6 +74,8 @@ def text_report(report: EvaluationReport, *, details: bool = True) -> str:
                     continue
                 if not grade.passed:
                     reasons.append(f"{grade.grader} grader: {grade.feedback or 'failed'}")
+            if score.diagnostics:
+                reasons.append("First divergence: " + _diagnostic_summary(score.diagnostics[0]))
             lines.append(f"  - {score.scenario}: {'; '.join(reasons) or 'missing result'}")
     return "\n".join(lines)
 
@@ -136,6 +148,26 @@ def sarif_report(report: EvaluationReport) -> str:
                 "actualIntent": score.actual_intent,
                 "missingQuestions": list(score.missing_questions),
                 "policyViolations": list(score.policy_violations),
+                "diagnostics": [
+                    {
+                        "category": item.category, "message": item.message,
+                        "turnIndex": item.turn_index, "toolCallIndex": item.tool_call_index,
+                        "eventIndex": item.event_index, "citationIds": list(item.citation_ids),
+                        "evidenceSources": list(item.evidence_sources),
+                    }
+                    for item in score.diagnostics
+                ],
+                "firstDivergence": (
+                    {
+                        "category": score.diagnostics[0].category,
+                        "message": score.diagnostics[0].message,
+                        "turnIndex": score.diagnostics[0].turn_index,
+                        "toolCallIndex": score.diagnostics[0].tool_call_index,
+                        "eventIndex": score.diagnostics[0].event_index,
+                        "citationIds": list(score.diagnostics[0].citation_ids),
+                    }
+                    if score.diagnostics else None
+                ),
             },
         })
     document = {
@@ -174,6 +206,8 @@ def _scenario_failure_reasons(score) -> list[str]:
     if score.policy_violations:
         reasons.append("policy violations: " + ", ".join(score.policy_violations))
     reasons.extend(score.turn_violations)
+    if score.diagnostics:
+        reasons.append("First divergence: " + _diagnostic_summary(score.diagnostics[0]))
     if score.notes:
         reasons.append(score.notes)
     for grade in score.answer_grades:
@@ -186,6 +220,20 @@ def _scenario_failure_reasons(score) -> list[str]:
 
 def _skipped_graders(score) -> list[str]:
     return [grade.grader for grade in score.answer_grades if grade.metadata.get("skipped") is True]
+
+
+def _diagnostic_summary(diagnostic) -> str:
+    location = []
+    if diagnostic.turn_index is not None:
+        location.append(f"turn {diagnostic.turn_index}")
+    if diagnostic.tool_call_index is not None:
+        location.append(f"tool call {diagnostic.tool_call_index}")
+    if diagnostic.event_index is not None:
+        location.append(f"trace event {diagnostic.event_index}")
+    prefix = " / ".join(location)
+    citations = ("; citations: " + ", ".join(diagnostic.citation_ids)
+                 if diagnostic.citation_ids else "")
+    return f"{prefix + ': ' if prefix else ''}{diagnostic.message}{citations}"
 
 
 def html_report(report: EvaluationReport) -> str:
@@ -234,6 +282,8 @@ def html_report(report: EvaluationReport) -> str:
                 failures.append(f"{grade.grader} grader: {grade.feedback or 'failed'}")
         if skipped_graders:
             failures.append("Skipped graders: " + ", ".join(skipped_graders))
+        if score.diagnostics:
+            failures.append("First divergence: " + _diagnostic_summary(score.diagnostics[0]))
         outcome = "Passed" if score.passed else "Failed"
         reason = "; ".join(failures) if failures else "—"
         scenario_rows.append(

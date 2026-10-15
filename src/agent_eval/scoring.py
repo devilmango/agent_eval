@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+import re
 from statistics import mean
 from pathlib import Path
 
 from agent_eval.graders import (AnswerGrader, SemanticJudge, grade_answer, load_grader_registry,
                                 load_judge_registry, public_grader_rubric)
-from agent_eval.models import AgentResult, EvaluationReport, GradeResult, Scenario, ScenarioScore, ToolCallExpectation
+from agent_eval.models import (AgentResult, EvaluationReport, FailureDiagnostic, GradeResult,
+                               Scenario, ScenarioScore, ToolCallExpectation)
 from agent_eval.results import ResultError
 
 
@@ -135,6 +137,174 @@ def _check_turn_expectations(scenario: Scenario, result: AgentResult) -> tuple[s
     return tuple(violations)
 
 
+def _scenario_diagnostics(
+    scenario: Scenario, result: AgentResult, *, intent_correct: bool,
+    missing_questions: tuple[str, ...], unnecessary_questions: tuple[str, ...],
+    policy_violations: tuple[str, ...],
+    answer_grades: tuple[GradeResult, ...],
+) -> tuple[FailureDiagnostic, ...]:
+    diagnostics: list[FailureDiagnostic] = []
+    observed_turns = result.turns
+    if scenario.turns:
+        for index, expected in enumerate(scenario.turns, start=1):
+            actual = observed_turns[index - 1] if index <= len(observed_turns) else None
+            if actual is None:
+                diagnostics.append(FailureDiagnostic(
+                    "turn", f"expected turn {index} was not returned", turn_index=index,
+                    expected=expected.input, actual=None,
+                ))
+                continue
+            if expected.intent and expected.intent.casefold() != actual.intent.casefold():
+                diagnostics.append(FailureDiagnostic(
+                    "intent", f"turn {index} intent differed", turn_index=index,
+                    expected=expected.intent, actual=actual.intent,
+                ))
+            actual_questions = _normalized(actual.asked)
+            for question in expected.must_ask:
+                if question.casefold() not in actual_questions:
+                    diagnostics.append(FailureDiagnostic(
+                        "question", f"turn {index} omitted required question {question!r}",
+                        turn_index=index, expected=question, actual=list(actual.asked),
+                    ))
+            unexpected = [question for question in actual.asked
+                          if question.casefold() not in _normalized(expected.must_ask)
+                          and question.casefold() not in _normalized(expected.allowed_questions)]
+            for question in unexpected:
+                diagnostics.append(FailureDiagnostic(
+                    "question", f"turn {index} asked unexpected question {question!r}",
+                    turn_index=index, expected=list(expected.must_ask), actual=question,
+                ))
+            if expected.expected_tools is not None and _normalized(expected.expected_tools) != _normalized(actual.tools):
+                diagnostics.append(FailureDiagnostic(
+                    "tool", f"turn {index} tool set differed", turn_index=index,
+                    expected=list(expected.expected_tools), actual=list(actual.tools),
+                ))
+            diagnostics.extend(_tool_call_diagnostics(
+                expected.expected_tool_calls, actual.tool_calls, turn_index=index,
+            ))
+            turn_result = AgentResult(
+                scenario=scenario.name, intent=actual.intent, actions=actual.actions,
+                events=actual.events,
+            )
+            for rule in expected.must_not:
+                missing = _missing_policy_prerequisites(turn_result, rule.action, rule.unless_asked)
+                if rule.action.casefold() in _normalized(actual.actions) and (
+                    not rule.unless_asked or missing
+                ):
+                    event_index = next((i + 1 for i, event in enumerate(actual.events)
+                                        if event.event_type == "action"
+                                        and event.name.casefold() == rule.action.casefold()), None)
+                    diagnostics.append(FailureDiagnostic(
+                        "policy", f"turn {index} performed prohibited action {rule.action!r}",
+                        turn_index=index, event_index=event_index,
+                        expected=f"confirmation before {rule.action}" if rule.unless_asked else "no action",
+                        actual=rule.action,
+                    ))
+        if len(observed_turns) > len(scenario.turns):
+            diagnostics.append(FailureDiagnostic(
+                "turn", f"received {len(observed_turns) - len(scenario.turns)} unexpected extra turn(s)",
+                turn_index=len(scenario.turns) + 1,
+                expected=len(scenario.turns), actual=len(observed_turns),
+            ))
+
+    result_turn = len(observed_turns) if observed_turns else None
+    if not intent_correct:
+        diagnostics.append(FailureDiagnostic(
+            "intent", "final intent differed", turn_index=result_turn,
+            expected=scenario.intent, actual=result.intent,
+        ))
+    for question in missing_questions:
+        diagnostics.append(FailureDiagnostic(
+            "question", f"required question {question!r} was not asked", turn_index=result_turn,
+            expected=question, actual=list(result.asked),
+        ))
+    for question in unnecessary_questions:
+        diagnostics.append(FailureDiagnostic(
+            "question", f"unexpected question {question!r} was asked", turn_index=result_turn,
+            expected=list((*scenario.must_ask, *scenario.allowed_questions)), actual=question,
+        ))
+    if scenario.expected_tools is not None and _normalized(scenario.expected_tools) != _normalized(result.tools):
+        diagnostics.append(FailureDiagnostic(
+            "tool", "tool set differed", turn_index=result_turn,
+            expected=list(scenario.expected_tools), actual=list(result.tools),
+        ))
+    diagnostics.extend(_tool_call_diagnostics(
+        scenario.expected_tool_calls, result.tool_calls, turn_index=result_turn,
+    ))
+    for violation in policy_violations:
+        action = violation.split(" (unless asked:", 1)[0]
+        event_index = next((i + 1 for i, event in enumerate(result.events)
+                            if event.event_type == "action" and event.name.casefold() == action.casefold()), None)
+        diagnostics.append(FailureDiagnostic(
+            "policy", f"prohibited action {action!r} was performed", turn_index=result_turn,
+            event_index=event_index, expected="prerequisite before action" if "unless asked" in violation else "no action",
+            actual=action,
+        ))
+    for grade in answer_grades:
+        if grade.passed or grade.metadata.get("skipped") is True:
+            continue
+        turn_index = result_turn
+        if grade.grader == "evidence_entailment":
+            claims = grade.metadata.get("claims", [])
+            for index, claim in enumerate(claims, start=1):
+                if claim.get("passed"):
+                    continue
+                citations = tuple(claim.get("citations", []))
+                diagnostics.append(FailureDiagnostic(
+                    "evidence", f"claim {index} was not entailed: {claim.get('feedback', '')}",
+                    turn_index=turn_index, citation_ids=citations,
+                    evidence_sources=citations, expected="claim supported by cited evidence",
+                    actual=claim.get("claim"),
+                ))
+            for error in grade.metadata.get("citation_errors", []):
+                citations = tuple(re.findall(r"source ['\"]([^'\"]+)", error))
+                diagnostics.append(FailureDiagnostic(
+                    "evidence", error, turn_index=turn_index, citation_ids=citations,
+                    evidence_sources=citations,
+                ))
+        else:
+            citations = tuple(grade.metadata.get("citations", []))
+            known = _evidence_source_ids(grade.rubric)
+            diagnostics.append(FailureDiagnostic(
+                "evidence" if grade.grader == "evidence_grounded" else "answer_grader",
+                f"{grade.grader} grader failed: {grade.feedback or 'failed'}",
+                turn_index=turn_index, citation_ids=citations,
+                evidence_sources=tuple(item for item in citations if item in known),
+                expected="answer satisfies grader", actual=grade.feedback,
+            ))
+    return tuple(diagnostics)
+
+
+def _tool_call_diagnostics(expected: tuple[ToolCallExpectation, ...] | None,
+                           actual: tuple, *, turn_index: int | None) -> list[FailureDiagnostic]:
+    if expected is None:
+        return []
+    diagnostics: list[FailureDiagnostic] = []
+    for index in range(max(len(expected), len(actual))):
+        wanted = expected[index] if index < len(expected) else None
+        observed = actual[index] if index < len(actual) else None
+        expected_value = None if wanted is None else {"name": wanted.name, "arguments": wanted.arguments}
+        actual_value = None if observed is None else {"name": observed.name, "arguments": observed.arguments}
+        mismatch = (wanted is None or observed is None
+                    or wanted.name.casefold() != observed.name.casefold()
+                    or any(not _matches(observed.arguments, path, matcher)
+                           for path, matcher in wanted.arguments.items()))
+        if mismatch:
+            diagnostics.append(FailureDiagnostic(
+                "tool_call", f"tool call {index + 1} differed from expectation",
+                turn_index=turn_index, tool_call_index=index + 1,
+                expected=expected_value, actual=actual_value,
+            ))
+    return diagnostics
+
+
+def _evidence_source_ids(rubric: dict) -> set[str]:
+    evidence = rubric.get("evidence", [])
+    if isinstance(evidence, dict):
+        return {str(item) for item in evidence}
+    return {item["id"] for item in evidence if isinstance(item, dict) and isinstance(item.get("id"), str)}
+
+
 def score_scenario(
     scenario: Scenario,
     result: AgentResult,
@@ -204,6 +374,13 @@ def score_scenario(
         and all(grade.passed or grade.metadata.get("skipped") is True for grade in answer_grades)
         and not turn_violations
     )
+    diagnostics = _scenario_diagnostics(
+        scenario, result, intent_correct=intent_correct, missing_questions=missing,
+        unnecessary_questions=unnecessary, policy_violations=tuple(violations),
+        answer_grades=answer_grades,
+    )
+    if not passed and not diagnostics:
+        diagnostics = (FailureDiagnostic("scenario", "scenario did not pass its declared expectations"),)
     return ScenarioScore(
         scenario=scenario.name,
         passed=passed,
@@ -220,6 +397,7 @@ def score_scenario(
         answer_grades=answer_grades,
         turn_violations=turn_violations,
         notes=result.notes,
+        diagnostics=diagnostics,
     )
 
 
@@ -268,6 +446,7 @@ def evaluate(
                     if scenario.expected_tool_calls is not None
                     else (),
                     notes="No agent result was provided.",
+                    diagnostics=(FailureDiagnostic("result", "No agent result was provided."),),
                     answer_grades=tuple(
                         GradeResult(
                             grader=spec["type"],

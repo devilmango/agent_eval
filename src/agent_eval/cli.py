@@ -255,6 +255,12 @@ def build_parser() -> argparse.ArgumentParser:
     run_agent.add_argument("scenarios", type=Path, help="scenario YAML file or directory")
     run_agent.add_argument("--runner", required=True, help="runner entry-point name")
     run_agent.add_argument("--results", required=True, type=Path, help="write captured canonical JSONL results here")
+    run_agent.add_argument("--workers", type=int, default=1,
+                           help="maximum concurrent scenario executions (default: 1)")
+    run_agent.add_argument("--checkpoint", type=Path,
+                           help="atomically save completed scenarios and resume matching work")
+    run_agent.add_argument("--cache", type=Path,
+                           help="reuse matching results across runs from this incremental cache")
     run_agent.add_argument("--report", type=Path, help="write evaluation report here (defaults to stdout)")
     run_agent.add_argument("--format", choices=("text", "json", "html", "junit", "sarif"), default="text")
     run_agent.add_argument("--judge-cache", type=Path, help="cache semantic judge results in this JSON file")
@@ -1131,13 +1137,22 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "run-agent":
             runner = load_runner(args.runner)
-            results = execute_scenarios(scenarios, runner)
+            execution_stats: dict[str, int] = {}
+            runner_version = getattr(runner, "version", "unspecified")
+            results = execute_scenarios(
+                scenarios, runner, max_workers=args.workers,
+                checkpoint=args.checkpoint, cache=args.cache,
+                runner_key=f"{args.runner}@{runner_version}",
+                runner_factory=(lambda: load_runner(args.runner)) if args.workers > 1 else None,
+                stats=execution_stats,
+            )
             args.results.write_text(
                 "".join(json.dumps(result_as_dict(result), ensure_ascii=False) + "\n" for result in results),
                 encoding="utf-8",
             )
             report = evaluate(scenarios, {result.scenario: result for result in results}, strict=True,
                               judge_cache=args.judge_cache, judge_repetitions=args.judge_repetitions)
+            report.execution["agent_execution"] = execution_stats
             report, budgets_passed = apply_budgets(
                 report, {result.scenario: result for result in results}, len(scenarios),
                 max_cost_usd=args.max_cost_usd, max_input_tokens=args.max_input_tokens,
@@ -1147,6 +1162,10 @@ def main(argv: list[str] | None = None) -> int:
                               {result.scenario: result for result in results}, report,
                               {"command": "run-agent", "runner": args.runner, "format": args.format,
                                "strict": True, "selected_scenarios": [item.name for item in scenarios],
+                               "execution": execution_stats,
+                               "workers": args.workers,
+                               "checkpoint": str(args.checkpoint) if args.checkpoint else None,
+                               "cache": str(args.cache) if args.cache else None,
                                "judge_repetitions": args.judge_repetitions,
                                "budgets": {"max_cost_usd": args.max_cost_usd,
                                            "max_input_tokens": args.max_input_tokens,

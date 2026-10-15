@@ -139,6 +139,34 @@ agent-eval run-agent scenarios/ --runner my-agent \
   --results run.jsonl --report report.html --format html
 ```
 
+For larger suites, `run-agent` can execute independent scenarios concurrently and
+reuse completed work across interrupted or repeated runs:
+
+```bash
+agent-eval run-agent scenarios/ --runner my-agent \
+  --results run.jsonl --workers 8 \
+  --checkpoint .agent-eval/checkpoint.json \
+  --cache .agent-eval/cache.json --format json
+```
+
+`--workers` defaults to `1`. The CLI creates one runner instance per worker so
+stateful plugins do not share a single instance across concurrent calls. Runner
+plugins should still isolate any shared provider clients or external state they
+use. Results are returned and written in scenario input order regardless of
+completion order. The checkpoint is updated atomically after every completed
+scenario; rerunning with the same path resumes entries whose scenario and runner
+fingerprints still match. The optional cache applies the same matching rule
+across separate runs. Scenario fingerprints cover declared scenario content,
+and runner identity includes the entry-point name and its optional `version`
+attribute. Bump the runner version when behavior changes. Keep these JSON files
+with the same care as captured agent results because they can contain answers,
+tool arguments, or other evaluation data.
+
+Failure diagnostics are available in JSON under each scenario's `diagnostics`
+and `first_divergence` fields. They identify turn numbers, tool-call positions,
+trace event positions, and evidence citation IDs where applicable. Text, HTML,
+JUnit, and SARIF reports surface the first divergence for quick triage.
+
 A runner implements `run_turn(scenario, user_input, history) -> AgentTurnResult`. Agent Eval calls it once for a single-turn scenario and sequentially for each `turns` entry, passing prior turn results as history. The runner owns provider setup, tool execution, timeouts, and credentials; it should return observed structured behavior instead of inferring tool use from answer text.
 
 Register it from the runner package's `pyproject.toml`:
