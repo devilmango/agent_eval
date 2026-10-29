@@ -165,6 +165,51 @@ attribute. Bump the runner version when behavior changes. Keep these JSON files
 with the same care as captured agent results because they can contain answers,
 tool arguments, or other evaluation data.
 
+Inspect an execution cache without printing captured answers or tool arguments:
+
+```bash
+agent-eval cache inspect .agent-eval/cache.json
+agent-eval cache inspect .agent-eval/cache.json --format json
+```
+
+Explain hits and invalidation for the scenarios and runner identity you plan to
+use. `--runner-key` must match the identity recorded by `run-agent` (the runner
+entry-point name and its version, or `unspecified` when it has no version):
+
+```bash
+agent-eval cache explain .agent-eval/cache.json scenarios/ --runner-key my-agent@v2
+agent-eval cache check .agent-eval/cache.json scenarios/ --runner-key my-agent@v2
+agent-eval run-agent scenarios/ --runner my-agent --cache .agent-eval/cache.json \
+  --check-cache --results run.jsonl
+```
+
+The report distinguishes runner changes, absent entries, and changed scenario
+fingerprints. Runner identity mismatches make `cache check` fail before a run;
+individual stale or absent scenario entries are reported as misses and will be
+recomputed. Completed entries now include an update timestamp. Prune only entries
+older than the chosen age, preview first with `--dry-run`, and preserve older
+cache entries without timestamps unless `--include-unknown-age` is explicit:
+
+```bash
+agent-eval cache prune .agent-eval/cache.json --older-than-days 30 --dry-run
+agent-eval cache prune .agent-eval/cache.json --older-than-days 30
+```
+
+Minimize a failed captured multi-turn result locally, without calling the agent
+provider again:
+
+```bash
+agent-eval minimize scenarios/ --responses run.jsonl \
+  --scenario appointment_reschedule --output minimized.json
+```
+
+The JSON report records the failure category retained, removed turn and trace
+event details, a reduced scenario/result pair, and a final reproduction check.
+Reduction is deterministic and 1-minimal under single-turn and single-event
+deletion: no remaining individual turn or event can be removed while preserving
+the selected diagnostic category. Semantic judge calls are skipped during this
+local reduction, so use it for failures reproducible by deterministic graders.
+
 Provider limits are keyed by the runner's `provider` attribute; if it has none,
 the `--runner` entry-point name is used. Repeat `--provider-limit PROVIDER=N`
 to configure separate providers. A scenario timeout is a wall-clock deadline;

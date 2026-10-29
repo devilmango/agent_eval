@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import tempfile
+from datetime import datetime, timezone
 from threading import BoundedSemaphore, Event, local
 from time import monotonic, perf_counter
 from typing import Any, Protocol
@@ -424,7 +425,11 @@ def _save_completed(
 ) -> None:
     from agent_eval.adapters import result_as_dict
 
-    entry = {"fingerprint": fingerprint, "result": result_as_dict(result)}
+    entry = {
+        "fingerprint": fingerprint,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "result": result_as_dict(result),
+    }
     for state in (checkpoint_state, cache_state):
         state["results"][scenario.name] = entry
     for path, state in ((checkpoint, checkpoint_state), (cache, cache_state)):

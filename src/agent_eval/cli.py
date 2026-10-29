@@ -15,6 +15,7 @@ from typing import Any
 
 from agent_eval import __version__
 from agent_eval.bundles import BundleError, create_bundle, replay_bundle, verify_bundle
+from agent_eval.cache_tools import CacheError, explain_cache, inspect_cache, prune_cache
 from agent_eval.distributed import (ShardError, create_shard_manifest, merge_shard_results,
                                     select_shard)
 from agent_eval.calibration import (CalibrationError, calibrate_grounding, calibrate_judge,
@@ -39,6 +40,7 @@ from agent_eval.history_gates import (evaluate_history_gates, load_history_gate_
 from agent_eval.models import AgentResult
 from agent_eval.monitoring import (drift_report, experiment_matrix, github_annotation_report,
                                    github_scenario_impact_report, read_variant_spec)
+from agent_eval.minimize import MinimizeError, minimize_failure
 from agent_eval.otel import OpenTelemetryAdapter, load_otel_document
 from agent_eval.portable_baseline import (PortableBaselineError, export_portable_baseline,
                                           import_portable_baseline)
@@ -265,6 +267,8 @@ def build_parser() -> argparse.ArgumentParser:
                            help="atomically save completed scenarios and resume matching work")
     run_agent.add_argument("--cache", type=Path,
                            help="reuse matching results across runs from this incremental cache")
+    run_agent.add_argument("--check-cache", action="store_true",
+                           help="check cache format and runner identity before executing")
     run_agent.add_argument("--provider-limit", action="append", default=[], metavar="PROVIDER=N",
                            help="cap simultaneous calls for a provider (repeatable)")
     run_agent.add_argument("--scenario-timeout", type=float,
@@ -280,6 +284,35 @@ def build_parser() -> argparse.ArgumentParser:
     run_agent.add_argument("--bundle-dir", type=Path, help="write a self-contained, hash-verified run bundle to a new directory")
     _add_budget_arguments(run_agent)
     _add_tag_filters(run_agent)
+
+    cache = commands.add_parser("cache", help="inspect, explain, check, or prune an execution cache")
+    cache_commands = cache.add_subparsers(dest="cache_command", required=True)
+    cache_inspect = cache_commands.add_parser("inspect", help="show cache metadata without exposing results")
+    cache_inspect.add_argument("cache_file", type=Path)
+    cache_inspect.add_argument("--format", choices=("text", "json"), default="text")
+    cache_inspect.add_argument("--output", type=Path)
+    for cache_command, help_text in (("check", "check runner and scenario compatibility before a run"),
+                                     ("explain", "explain cache hits and misses for scenarios")):
+        cache_detail = cache_commands.add_parser(cache_command, help=help_text)
+        cache_detail.add_argument("cache_file", type=Path)
+        cache_detail.add_argument("scenarios", type=Path, help="scenario YAML file or directory")
+        cache_detail.add_argument("--runner-key", required=True, help="same runner identity used by run-agent")
+        cache_detail.add_argument("--format", choices=("text", "json"), default="text")
+        cache_detail.add_argument("--output", type=Path)
+    cache_prune = cache_commands.add_parser("prune", help="remove entries older than a specified age")
+    cache_prune.add_argument("cache_file", type=Path)
+    cache_prune.add_argument("--older-than-days", type=float, required=True)
+    cache_prune.add_argument("--dry-run", action="store_true", help="report eligible entries without deleting them")
+    cache_prune.add_argument("--include-unknown-age", action="store_true",
+                             help="also remove legacy entries that have no completion timestamp")
+    cache_prune.add_argument("--format", choices=("text", "json"), default="text")
+    cache_prune.add_argument("--output", type=Path)
+
+    minimize = commands.add_parser("minimize", help="reduce a recorded failure to a smaller reproducible trace")
+    minimize.add_argument("scenarios", type=Path, help="scenario YAML file or directory")
+    minimize.add_argument("--responses", required=True, type=Path, help="canonical JSONL results from the failing run")
+    minimize.add_argument("--scenario", required=True, help="scenario name to minimize")
+    minimize.add_argument("--output", type=Path, help="write the minimized reproduction report to a JSON file")
 
     shard = commands.add_parser("shard", help="write a deterministic manifest for distributed scenario execution")
     shard.add_argument("scenarios", type=Path, help="scenario YAML file or directory")
@@ -491,6 +524,62 @@ def _selected_results(path: Path, all_scenarios: list, selected_scenarios: list)
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
+        if args.command == "cache":
+            if args.cache_command == "inspect":
+                report = inspect_cache(args.cache_file)
+                if args.format == "json":
+                    rendered = json.dumps(report, indent=2, ensure_ascii=False)
+                else:
+                    lines = [f"Execution cache: {report['path']}",
+                             f"Runner: {report['runner_key'] or '(unknown)' }",
+                             f"Entries: {report['entry_count']} ({report['dated_entries']} dated, "
+                             f"{report['unknown_age_entries']} age unknown)"]
+                    lines.extend(f"  {entry['scenario']}: {entry['age_days']} days old" if entry['age_days'] is not None
+                                 else f"  {entry['scenario']}: age unknown" for entry in report["entries"])
+                    rendered = "\n".join(lines)
+                _write_output(args.output, rendered)
+                return 0
+            if args.cache_command in {"check", "explain"}:
+                requested_scenarios = load_scenarios(args.scenarios)
+                report = explain_cache(args.cache_file, requested_scenarios, runner_key=args.runner_key)
+                if args.format == "json":
+                    rendered = json.dumps(report, indent=2, ensure_ascii=False)
+                else:
+                    lines = [f"Cache compatibility: {'compatible' if report['compatible'] else 'incompatible'}",
+                             f"Runner: {'matches' if report['runner_key_matches'] else 'does not match'}",
+                             f"Scenario cache hits: {report['hit_count']}; misses: {report['miss_count']}"]
+                    lines.extend(f"  {item['status'].upper()} {item['scenario']}: {item['reason']}"
+                                 for item in report["scenarios"])
+                    if report["unused_entries"]:
+                        lines.append("Unused cache entries: " + ", ".join(report["unused_entries"]))
+                    rendered = "\n".join(lines)
+                _write_output(args.output, rendered)
+                return 0 if report["compatible"] else 1
+            report = prune_cache(args.cache_file, older_than_days=args.older_than_days,
+                                 dry_run=args.dry_run, include_unknown_age=args.include_unknown_age)
+            rendered = json.dumps(report, indent=2, ensure_ascii=False) if args.format == "json" else (
+                f"Cache prune {'preview' if args.dry_run else 'complete'}: "
+                f"{report['removed_count']} removed; {report['remaining_count']} remain"
+                + ("\nRemoved: " + ", ".join(report["removed"]) if report["removed"] else "")
+                + ("\nKept age-unknown entries: " + ", ".join(report["retained_unknown_age"])
+                   if report["retained_unknown_age"] else "")
+            )
+            _write_output(args.output, rendered)
+            return 0
+
+        if args.command == "minimize":
+            scenario_rows = load_scenarios(args.scenarios)
+            scenario = next((item for item in scenario_rows if item.name == args.scenario), None)
+            if scenario is None:
+                raise MinimizeError(f"scenario '{args.scenario}' was not found")
+            results = load_results(args.responses)
+            result = results.get(args.scenario)
+            if result is None:
+                raise MinimizeError(f"no recorded result for scenario '{args.scenario}'")
+            report = minimize_failure(scenario, result)
+            _write_output(args.output, json.dumps(report, indent=2, ensure_ascii=False))
+            return 0
+
         if args.command == "verify-bundle":
             verification = verify_bundle(args.bundle)
             rendered = json.dumps(verification, indent=2, ensure_ascii=False) if args.format == "json" else (
@@ -1201,6 +1290,14 @@ def main(argv: list[str] | None = None) -> int:
             runner = load_runner(args.runner)
             execution_stats: dict[str, int] = {}
             runner_version = getattr(runner, "version", "unspecified")
+            if args.check_cache:
+                if args.cache is None:
+                    raise RunnerError("--check-cache requires --cache")
+                preflight = explain_cache(args.cache, scenarios,
+                                          runner_key=f"{args.runner}@{runner_version}")
+                print(json.dumps(preflight, indent=2, ensure_ascii=False), file=sys.stderr)
+                if not preflight["compatible"]:
+                    raise RunnerError("cache preflight failed: runner identity does not match")
             cancel_event = Event()
             previous_handlers = {}
 
@@ -1293,7 +1390,9 @@ def main(argv: list[str] | None = None) -> int:
                                        "max_input_tokens": args.max_input_tokens,
                                        "max_output_tokens": args.max_output_tokens,
                                        "max_p95_latency_ms": args.max_p95_latency_ms}})
-    except (AdapterError, DraftError, GateProfileError, HistoryError, GraderError, RedactionError, RunnerError, ScenarioError, ResultError, OSError, ValueError) as exc:
+    except (AdapterError, BundleError, CacheError, DraftError, GateProfileError, HistoryError,
+            GraderError, MinimizeError, RedactionError, RunnerError, ScenarioError, ResultError,
+            OSError, ValueError) as exc:
         print(f"agent-eval: error: {exc}", file=sys.stderr)
         return 2
 
