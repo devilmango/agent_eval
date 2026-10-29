@@ -145,6 +145,7 @@ reuse completed work across interrupted or repeated runs:
 ```bash
 agent-eval run-agent scenarios/ --runner my-agent \
   --results run.jsonl --workers 8 \
+  --provider-limit openai=3 --scenario-timeout 45 \
   --checkpoint .agent-eval/checkpoint.json \
   --cache .agent-eval/cache.json --format json
 ```
@@ -152,7 +153,9 @@ agent-eval run-agent scenarios/ --runner my-agent \
 `--workers` defaults to `1`. The CLI creates one runner instance per worker so
 stateful plugins do not share a single instance across concurrent calls. Runner
 plugins should still isolate any shared provider clients or external state they
-use. Results are returned and written in scenario input order regardless of
+use. Limits coordinate calls within one `run-agent` process; CI jobs on separate
+machines need appropriately sized limits of their own. Use separate checkpoint
+and cache files for concurrently running shards. Results are returned and written in scenario input order regardless of
 completion order. The checkpoint is updated atomically after every completed
 scenario; rerunning with the same path resumes entries whose scenario and runner
 fingerprints still match. The optional cache applies the same matching rule
@@ -162,12 +165,42 @@ attribute. Bump the runner version when behavior changes. Keep these JSON files
 with the same care as captured agent results because they can contain answers,
 tool arguments, or other evaluation data.
 
-Failure diagnostics are available in JSON under each scenario's `diagnostics`
-and `first_divergence` fields. They identify turn numbers, tool-call positions,
-trace event positions, and evidence citation IDs where applicable. Text, HTML,
-JUnit, and SARIF reports surface the first divergence for quick triage.
+Provider limits are keyed by the runner's `provider` attribute; if it has none,
+the `--runner` entry-point name is used. Repeat `--provider-limit PROVIDER=N`
+to configure separate providers. A scenario timeout is a wall-clock deadline;
+plugins can accept an `execution_control` keyword and call
+`execution_control.raise_if_cancelled()` while waiting on provider operations.
+Legacy runners remain supported, but a synchronous call that does not poll the
+control handle cannot be interrupted mid-call; it is marked timed out when it
+returns. On SIGINT or SIGTERM, the CLI stops submitting scenarios, lets active
+calls finish or honor cancellation, writes completed results and checkpoints,
+then exits with status `130`.
 
-A runner implements `run_turn(scenario, user_input, history) -> AgentTurnResult`. Agent Eval calls it once for a single-turn scenario and sequentially for each `turns` entry, passing prior turn results as history. The runner owns provider setup, tool execution, timeouts, and credentials; it should return observed structured behavior instead of inferring tool use from answer text.
+To distribute one exact suite across jobs, create a manifest and pass the same
+manifest to each runner job with a different zero-based shard index:
+
+```bash
+agent-eval shard scenarios/ --count 4 --output shard-manifest.json
+agent-eval run-agent scenarios/ --runner my-agent --shard-manifest shard-manifest.json \
+  --shard-index 0 --results results-0.jsonl
+agent-eval merge-results scenarios/ --manifest shard-manifest.json \
+  --shard-result 0=results-0.jsonl --shard-result 1=results-1.jsonl \
+  --shard-result 2=results-2.jsonl --shard-result 3=results-3.jsonl \
+  --output merged-results.jsonl
+```
+
+The manifest fingerprints every scenario and assigns each exactly once. A shard
+run rejects a changed suite; merging rejects duplicate shards or scenarios,
+unexpected assignments, and missing shard results. Keep separate checkpoint
+state files per shard when running jobs concurrently.
+
+Failure diagnostics are available in JSON under each scenario's `diagnostics`
+and `first_divergence` fields. The ordered `trace_timeline` shows user inputs,
+expected and observed intents/questions/tool selections/tool calls, policy
+events, answers, and citations, with the first failed expectation marked.
+Text, HTML, JUnit, and SARIF reports include the timeline for triage.
+
+A runner implements `run_turn(scenario, user_input, history) -> AgentTurnResult`. Agent Eval calls it once for a single-turn scenario and sequentially for each `turns` entry, passing prior turn results as history. It may accept the optional `execution_control` keyword; call its `raise_if_cancelled()` between provider operations to stop promptly and enforce the configured deadline. The runner owns provider setup, tool execution, timeouts, and credentials; it should return observed structured behavior instead of inferring tool use from answer text.
 
 Register it from the runner package's `pyproject.toml`:
 

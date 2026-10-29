@@ -77,6 +77,7 @@ def text_report(report: EvaluationReport, *, details: bool = True) -> str:
             if score.diagnostics:
                 reasons.append("First divergence: " + _diagnostic_summary(score.diagnostics[0]))
             lines.append(f"  - {score.scenario}: {'; '.join(reasons) or 'missing result'}")
+            lines.extend("      " + _timeline_line(item) for item in score.trace_timeline)
     return "\n".join(lines)
 
 
@@ -124,6 +125,9 @@ def junit_report(report: EvaluationReport) -> str:
             ET.SubElement(case, "skipped", {
                 "message": "Semantic grader(s) skipped: " + ", ".join(_skipped_graders(score)),
             })
+        if score.trace_timeline:
+            output = ET.SubElement(case, "system-out")
+            output.text = json.dumps(score.trace_timeline, ensure_ascii=False)
     return ET.tostring(suite, encoding="unicode", xml_declaration=True)
 
 
@@ -168,6 +172,7 @@ def sarif_report(report: EvaluationReport) -> str:
                     }
                     if score.diagnostics else None
                 ),
+                "traceTimeline": list(score.trace_timeline),
             },
         })
     document = {
@@ -236,6 +241,21 @@ def _diagnostic_summary(diagnostic) -> str:
     return f"{prefix + ': ' if prefix else ''}{diagnostic.message}{citations}"
 
 
+def _timeline_value(value) -> str:
+    if value is None:
+        return "—"
+    if isinstance(value, (dict, list, tuple)):
+        return json.dumps(value, ensure_ascii=False, sort_keys=True)
+    return str(value)
+
+
+def _timeline_line(item) -> str:
+    marker = "  ← FIRST DIVERGENCE" if item.get("first_divergence") else ""
+    return (f"turn {item['turn_index']} · {item['kind']}: "
+            f"expected {_timeline_value(item.get('expected'))}; "
+            f"observed {_timeline_value(item.get('observed'))}{marker}")
+
+
 def html_report(report: EvaluationReport) -> str:
     metric_rows = "\n".join(
         f"<tr><th scope=\"row\">{escape(label)}</th><td>{escape(format_percent(value))}</td></tr>"
@@ -286,11 +306,24 @@ def html_report(report: EvaluationReport) -> str:
             failures.append("First divergence: " + _diagnostic_summary(score.diagnostics[0]))
         outcome = "Passed" if score.passed else "Failed"
         reason = "; ".join(failures) if failures else "—"
+        timeline = ""
+        if score.trace_timeline:
+            rows = []
+            for item in score.trace_timeline:
+                css = " class=\"divergence\"" if item.get("first_divergence") else ""
+                rows.append(
+                    f"<li{css}><strong>{escape(str(item['kind']))}</strong> "
+                    f"(turn {item['turn_index']}): expected "
+                    f"{escape(_timeline_value(item.get('expected')))}; observed "
+                    f"{escape(_timeline_value(item.get('observed')))}</li>"
+                )
+            timeline = ("<details><summary>Trace timeline</summary><ol>" +
+                        "".join(rows) + "</ol></details>")
         scenario_rows.append(
             "<tr>"
             f"<th scope=\"row\">{escape(score.scenario)}</th>"
             f"<td><span class=\"status {'pass' if score.passed else 'fail'}\">{outcome}</span></td>"
-            f"<td>{escape(reason)}</td>"
+            f"<td>{escape(reason)}{timeline}</td>"
             "</tr>"
         )
     summary = f"{report.passed} of {report.total} scenarios passed"
@@ -443,6 +476,11 @@ def _document(title: str, body: str) -> str:
     .status {{ border-radius: 999px; display: inline-block; font-size: .85rem; font-weight: 700; padding: 3px 10px; }}
     .pass {{ color: #17663a; background: #e5f5eb; }}
     .fail {{ color: #9b1c1c; background: #fde8e7; }}
+    details {{ margin-top: 10px; }}
+    details summary {{ cursor: pointer; font-weight: 650; }}
+    details ol {{ padding-left: 22px; }}
+    details li {{ margin: 6px 0; }}
+    details li.divergence {{ color: #9b1c1c; font-weight: 700; }}
     @media (max-width: 600px) {{ main {{ padding: 24px 12px 48px; }} th, td {{ padding: 9px; }} }}
   </style>
 </head>

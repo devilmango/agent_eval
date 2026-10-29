@@ -9,8 +9,8 @@ from pathlib import Path
 
 from agent_eval.graders import (AnswerGrader, SemanticJudge, grade_answer, load_grader_registry,
                                 load_judge_registry, public_grader_rubric)
-from agent_eval.models import (AgentResult, EvaluationReport, FailureDiagnostic, GradeResult,
-                               Scenario, ScenarioScore, ToolCallExpectation)
+from agent_eval.models import (AgentResult, AgentTurnResult, EvaluationReport, FailureDiagnostic, GradeResult,
+                               Scenario, ScenarioScore, ScenarioTurn, ToolCallExpectation)
 from agent_eval.results import ResultError
 
 
@@ -305,6 +305,135 @@ def _evidence_source_ids(rubric: dict) -> set[str]:
     return {item["id"] for item in evidence if isinstance(item, dict) and isinstance(item.get("id"), str)}
 
 
+def _trace_timeline(scenario: Scenario, result: AgentResult) -> tuple[dict, ...]:
+    """Build a stable per-turn sequence from the ordered trace fields we capture."""
+    timeline: list[dict] = []
+    observed_turns = result.turns or (AgentTurnResult(
+        intent=result.intent, asked=result.asked, tools=result.tools, actions=result.actions,
+        tool_calls=result.tool_calls, events=result.events, answer=result.answer,
+        notes=result.notes, metadata=result.metadata,
+    ),)
+    prompts = scenario.turns or (ScenarioTurn(input=scenario.input),)
+    for index, prompt in enumerate(prompts, start=1):
+        actual = observed_turns[index - 1] if index <= len(observed_turns) else None
+
+        def add(kind: str, expected=None, observed=None, matched=None):
+            timeline.append({
+                "sequence": len(timeline) + 1,
+                "turn_index": index,
+                "kind": kind,
+                "expected": expected,
+                "observed": observed,
+                "matched": matched,
+                "first_divergence": False,
+            })
+
+        add("user_input", None, prompt.input, None)
+        expected_intent = (prompt.intent if scenario.turns else
+                           scenario.intent if index == len(prompts) else None)
+        if expected_intent is None and scenario.turns and index == len(prompts):
+            expected_intent = scenario.intent
+        add("intent", expected_intent, actual.intent if actual else None,
+            expected_intent.strip().casefold() == actual.intent.strip().casefold()
+            if expected_intent is not None and actual else False if expected_intent is not None else None)
+
+        required = prompt.must_ask if scenario.turns else scenario.must_ask
+        allowed = set(prompt.allowed_questions if scenario.turns else scenario.allowed_questions)
+        asked = actual.asked if actual else ()
+        for question in required:
+            observed = next((item for item in asked if item.casefold() == question.casefold()), None)
+            add("question", question, observed, observed is not None)
+        required_folded = {item.casefold() for item in required}
+        for question in asked:
+            expected = question if question.casefold() in required_folded else None
+            matched = True if expected is not None or question in allowed else False
+            if expected is None:
+                add("question", expected, question, matched)
+
+        expected_tools = prompt.expected_tools
+        if expected_tools is None and (not scenario.turns or index == len(prompts)):
+            expected_tools = scenario.expected_tools
+        if expected_tools is not None:
+            for tool in expected_tools:
+                observed = next((item for item in actual.tools if item.casefold() == tool.casefold()), None) if actual else None
+                add("tool_selection", tool, observed, observed is not None)
+            expected_folded = {item.casefold() for item in expected_tools}
+            if actual:
+                for tool in actual.tools:
+                    if tool.casefold() not in expected_folded:
+                        add("tool_selection", None, tool, False)
+
+        expected_calls = prompt.expected_tool_calls
+        if expected_calls is None and (not scenario.turns or index == len(prompts)):
+            expected_calls = scenario.expected_tool_calls
+        observed_calls = actual.tool_calls if actual else ()
+        if expected_calls is not None:
+            for call_index in range(max(len(expected_calls), len(observed_calls))):
+                expected_call = expected_calls[call_index] if call_index < len(expected_calls) else None
+                observed_call = observed_calls[call_index] if call_index < len(observed_calls) else None
+                expected_value = ({"name": expected_call.name, "arguments": expected_call.arguments}
+                                  if expected_call else None)
+                observed_value = ({"name": observed_call.name, "arguments": observed_call.arguments}
+                                  if observed_call else None)
+                matched = bool(expected_call and observed_call
+                               and expected_call.name.casefold() == observed_call.name.casefold()
+                               and all(_matches(observed_call.arguments, key, value)
+                                       for key, value in expected_call.arguments.items()))
+                add("tool_call", expected_value, observed_value, matched)
+        else:
+            for observed_call in observed_calls:
+                add("tool_call", None, {"name": observed_call.name,
+                                         "arguments": observed_call.arguments}, None)
+
+        rules = list(scenario.must_not)
+        if scenario.turns:
+            rules.extend(prompt.must_not)
+        forbidden = {rule.action.casefold() for rule in rules}
+        turn_result = AgentResult(
+            scenario=scenario.name, intent=actual.intent if actual else "",
+            actions=actual.actions if actual else (), events=actual.events if actual else (),
+        )
+
+        def violates_policy(action: str) -> bool:
+            return any(
+                rule.action.casefold() == action.casefold()
+                and (not rule.unless_asked or _missing_policy_prerequisites(
+                    turn_result, rule.action, rule.unless_asked,
+                ))
+                for rule in rules
+            )
+
+        event_rows = actual.events if actual else ()
+        if event_rows:
+            for event in event_rows:
+                if event.event_type == "action":
+                    add("policy_event", {"must_not": sorted(forbidden)}, event.name,
+                        not violates_policy(event.name))
+                else:
+                    add("trace_event", None, {"type": event.event_type, "name": event.name}, None)
+        elif actual:
+            for action in actual.actions:
+                add("policy_event", {"must_not": sorted(forbidden)}, action,
+                    not violates_policy(action))
+
+        answer = actual.answer if actual else None
+        add("answer", None, answer, None)
+        if answer:
+            evidence_ids = {
+                source
+                for grader in scenario.answer_graders
+                for source in _evidence_source_ids(grader)
+            }
+            for citation in re.findall(r"\[([A-Za-z0-9_.:-]+)\]", answer):
+                add("citation", sorted(evidence_ids) if evidence_ids else None, citation,
+                    citation in evidence_ids if evidence_ids else None)
+
+    first = next((item for item in timeline if item["matched"] is False), None)
+    if first is not None:
+        first["first_divergence"] = True
+    return tuple(timeline)
+
+
 def score_scenario(
     scenario: Scenario,
     result: AgentResult,
@@ -381,6 +510,7 @@ def score_scenario(
     )
     if not passed and not diagnostics:
         diagnostics = (FailureDiagnostic("scenario", "scenario did not pass its declared expectations"),)
+    timeline = _trace_timeline(scenario, result)
     return ScenarioScore(
         scenario=scenario.name,
         passed=passed,
@@ -398,6 +528,7 @@ def score_scenario(
         turn_violations=turn_violations,
         notes=result.notes,
         diagnostics=diagnostics,
+        trace_timeline=timeline,
     )
 
 

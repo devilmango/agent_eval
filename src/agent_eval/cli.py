@@ -7,12 +7,16 @@ from datetime import date
 from math import isfinite
 import json
 import os
+import signal
 import sys
 from pathlib import Path
+from threading import Event
 from typing import Any
 
 from agent_eval import __version__
 from agent_eval.bundles import BundleError, create_bundle, replay_bundle, verify_bundle
+from agent_eval.distributed import (ShardError, create_shard_manifest, merge_shard_results,
+                                    select_shard)
 from agent_eval.calibration import (CalibrationError, calibrate_grounding, calibrate_judge,
                                    text_calibration_report, text_grounding_calibration_report)
 from agent_eval.adapters import AdapterError, PathMappingAdapter, load_adapter_plugin, result_as_dict
@@ -261,6 +265,14 @@ def build_parser() -> argparse.ArgumentParser:
                            help="atomically save completed scenarios and resume matching work")
     run_agent.add_argument("--cache", type=Path,
                            help="reuse matching results across runs from this incremental cache")
+    run_agent.add_argument("--provider-limit", action="append", default=[], metavar="PROVIDER=N",
+                           help="cap simultaneous calls for a provider (repeatable)")
+    run_agent.add_argument("--scenario-timeout", type=float,
+                           help="per-scenario timeout in seconds (runner can poll execution_control)")
+    run_agent.add_argument("--shard-manifest", type=Path,
+                           help="run one partition described by an agent-eval shard manifest")
+    run_agent.add_argument("--shard-index", type=int,
+                           help="zero-based shard index; requires --shard-manifest")
     run_agent.add_argument("--report", type=Path, help="write evaluation report here (defaults to stdout)")
     run_agent.add_argument("--format", choices=("text", "json", "html", "junit", "sarif"), default="text")
     run_agent.add_argument("--judge-cache", type=Path, help="cache semantic judge results in this JSON file")
@@ -268,6 +280,18 @@ def build_parser() -> argparse.ArgumentParser:
     run_agent.add_argument("--bundle-dir", type=Path, help="write a self-contained, hash-verified run bundle to a new directory")
     _add_budget_arguments(run_agent)
     _add_tag_filters(run_agent)
+
+    shard = commands.add_parser("shard", help="write a deterministic manifest for distributed scenario execution")
+    shard.add_argument("scenarios", type=Path, help="scenario YAML file or directory")
+    shard.add_argument("--count", type=int, required=True, help="number of CI workers/shards")
+    shard.add_argument("--output", type=Path, required=True, help="write the shard manifest JSON")
+
+    merge = commands.add_parser("merge-results", help="validate and merge distributed shard result files")
+    merge.add_argument("scenarios", type=Path, help="scenario YAML file or directory used to create the manifest")
+    merge.add_argument("--manifest", required=True, type=Path, help="manifest from the shard command")
+    merge.add_argument("--shard-result", action="append", default=[], metavar="INDEX=PATH",
+                       help="result JSONL file for a shard (repeat once per shard)")
+    merge.add_argument("--output", required=True, type=Path, help="merged canonical results JSONL")
 
     coverage = commands.add_parser("coverage", help="summarize behavior dimensions declared by scenarios")
     coverage.add_argument("scenarios", type=Path, help="scenario YAML file or directory")
@@ -706,6 +730,30 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         all_scenarios = load_scenarios(args.scenarios) if hasattr(args, "scenarios") else []
+        if args.command == "shard":
+            manifest = create_shard_manifest(all_scenarios, shard_count=args.count)
+            _write_output(args.output, json.dumps(manifest, indent=2, ensure_ascii=False))
+            return 0
+        if args.command == "merge-results":
+            try:
+                manifest = json.loads(args.manifest.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise ShardError(f"could not read shard manifest {args.manifest}: {exc}") from exc
+            shard_results = []
+            for value in args.shard_result:
+                if "=" not in value:
+                    raise ShardError("--shard-result must use INDEX=PATH")
+                index_text, path_text = value.split("=", 1)
+                try:
+                    index = int(index_text)
+                except ValueError as exc:
+                    raise ShardError(f"invalid shard index {index_text!r}") from exc
+                shard_results.append((index, list(load_results(Path(path_text)).values())))
+            merged = merge_shard_results(all_scenarios, manifest, shard_results)
+            _write_output(args.output, "\n".join(
+                json.dumps(result_as_dict(result), ensure_ascii=False) for result in merged
+            ))
+            return 0
         if args.command == "robustness":
             report = run_robustness(
                 all_scenarios, load_runner(args.runner), types=args.type or VARIANT_TYPES,
@@ -1005,6 +1053,20 @@ def main(argv: list[str] | None = None) -> int:
             include_tags=tuple(args.tag),
             exclude_tags=tuple(args.exclude_tag),
         )
+        shard_manifest = None
+        if args.command == "run-agent":
+            if args.shard_manifest is not None:
+                if args.shard_index is None:
+                    raise ShardError("--shard-manifest requires --shard-index")
+                if args.tag or args.exclude_tag:
+                    raise ShardError("tag filters cannot be combined with a complete shard manifest")
+                try:
+                    shard_manifest = json.loads(args.shard_manifest.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError) as exc:
+                    raise ShardError(f"could not read shard manifest {args.shard_manifest}: {exc}") from exc
+                scenarios = select_shard(all_scenarios, shard_manifest, shard_index=args.shard_index)
+            elif args.shard_index is not None:
+                raise ShardError("--shard-index requires --shard-manifest")
         if args.command == "compare":
             baseline = evaluate(
                 scenarios, _selected_results(args.baseline, all_scenarios, scenarios), strict=args.strict
@@ -1139,18 +1201,41 @@ def main(argv: list[str] | None = None) -> int:
             runner = load_runner(args.runner)
             execution_stats: dict[str, int] = {}
             runner_version = getattr(runner, "version", "unspecified")
-            results = execute_scenarios(
-                scenarios, runner, max_workers=args.workers,
-                checkpoint=args.checkpoint, cache=args.cache,
-                runner_key=f"{args.runner}@{runner_version}",
-                runner_factory=(lambda: load_runner(args.runner)) if args.workers > 1 else None,
-                stats=execution_stats,
-            )
+            cancel_event = Event()
+            previous_handlers = {}
+
+            def request_cancel(signum, frame):
+                cancel_event.set()
+
+            for signum in (signal.SIGINT, getattr(signal, "SIGTERM", signal.SIGINT)):
+                if signum not in previous_handlers:
+                    previous_handlers[signum] = signal.getsignal(signum)
+                    signal.signal(signum, request_cancel)
+            execution_failed = False
+            try:
+                results = execute_scenarios(
+                    scenarios, runner, max_workers=args.workers,
+                    checkpoint=args.checkpoint, cache=args.cache,
+                    runner_key=f"{args.runner}@{runner_version}",
+                    runner_factory=(lambda: load_runner(args.runner)) if args.workers > 1 else None,
+                    stats=execution_stats, provider_key=args.runner,
+                    provider_limits=_parse_provider_limits(args.provider_limit),
+                    scenario_timeout=args.scenario_timeout, cancel_event=cancel_event,
+                )
+            except RunnerError as exc:
+                if not hasattr(exc, "partial_results"):
+                    raise
+                results = exc.partial_results
+                execution_stats = exc.execution_stats
+                execution_failed = True
+            finally:
+                for signum, handler in previous_handlers.items():
+                    signal.signal(signum, handler)
             args.results.write_text(
                 "".join(json.dumps(result_as_dict(result), ensure_ascii=False) + "\n" for result in results),
                 encoding="utf-8",
             )
-            report = evaluate(scenarios, {result.scenario: result for result in results}, strict=True,
+            report = evaluate(scenarios, {result.scenario: result for result in results}, strict=not execution_stats.get("cancelled", 0) and not execution_failed,
                               judge_cache=args.judge_cache, judge_repetitions=args.judge_repetitions)
             report.execution["agent_execution"] = execution_stats
             report, budgets_passed = apply_budgets(
@@ -1161,9 +1246,14 @@ def main(argv: list[str] | None = None) -> int:
                 create_bundle(args.bundle_dir, args.scenarios, scenarios,
                               {result.scenario: result for result in results}, report,
                               {"command": "run-agent", "runner": args.runner, "format": args.format,
-                               "strict": True, "selected_scenarios": [item.name for item in scenarios],
+                               "strict": not execution_failed and not execution_stats.get("cancelled", 0),
+                               "selected_scenarios": [item.name for item in scenarios],
                                "execution": execution_stats,
                                "workers": args.workers,
+                               "scenario_timeout": args.scenario_timeout,
+                               "provider_limits": _parse_provider_limits(args.provider_limit),
+                               "shard_index": args.shard_index,
+                               "shard_count": shard_manifest.get("shard_count") if shard_manifest else None,
                                "checkpoint": str(args.checkpoint) if args.checkpoint else None,
                                "cache": str(args.cache) if args.cache else None,
                                "judge_repetitions": args.judge_repetitions,
@@ -1182,7 +1272,9 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 rendered = text_report(report)
             _write_output(args.report, rendered)
-            return 0 if report.failed == 0 and budgets_passed else 1
+            if execution_stats.get("cancelled", 0):
+                return 130
+            return 0 if report.failed == 0 and budgets_passed and not execution_failed else 1
 
         results = _selected_results(args.responses, all_scenarios, scenarios)
         report = evaluate(scenarios, results, strict=args.strict,
@@ -1228,6 +1320,25 @@ def _write_output(path: Path | None, content: str) -> None:
 
 def _percent(value: float | None) -> str:
     return "n/a" if value is None else f"{value:.1%}"
+
+
+def _parse_provider_limits(values: list[str]) -> dict[str, int]:
+    limits: dict[str, int] = {}
+    for value in values:
+        provider, separator, limit_text = value.partition("=")
+        provider = provider.strip()
+        if not separator or not provider:
+            raise RunnerError("--provider-limit must use PROVIDER=N")
+        try:
+            limit = int(limit_text)
+        except ValueError as exc:
+            raise RunnerError(f"invalid provider limit {value!r}: N must be a positive integer") from exc
+        if provider in limits:
+            raise RunnerError(f"provider limit for '{provider}' was specified more than once")
+        if limit < 1:
+            raise RunnerError(f"provider limit for '{provider}' must be a positive integer")
+        limits[provider] = limit
+    return limits
 
 
 if __name__ == "__main__":

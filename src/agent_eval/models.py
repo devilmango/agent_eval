@@ -131,6 +131,7 @@ class ScenarioScore:
     turn_violations: tuple[str, ...] = ()
     notes: str = ""
     diagnostics: tuple[FailureDiagnostic, ...] = ()
+    trace_timeline: tuple[dict[str, Any], ...] = ()
 
     def as_dict(self) -> dict[str, Any]:
         value = asdict(self)
