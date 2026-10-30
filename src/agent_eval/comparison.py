@@ -151,4 +151,9 @@ def text_comparison(comparison: dict[str, Any]) -> str:
         lines.append("  + " + ", ".join(comparison["improved_scenarios"]))
     if comparison["regressed_scenarios"]:
         lines.append("  - " + ", ".join(comparison["regressed_scenarios"]))
+    provenance = comparison.get("provenance")
+    if provenance:
+        lines.extend(["", f"Provenance compatibility: {'compatible' if provenance['compatible'] else 'incompatible'}"])
+        for warning in provenance.get("warnings", []):
+            lines.append("  ! " + warning)
     return "\n".join(lines)

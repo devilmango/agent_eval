@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import asdict, replace
+from collections.abc import Callable
+from hashlib import sha256
+import json
 from typing import Any
 
 from agent_eval.adapters import result_as_dict
@@ -35,12 +38,59 @@ def _score(scenario: Scenario, result: AgentResult):
     return score_scenario(scenario, result, skip_semantic_judges=True)
 
 
-def minimize_failure(scenario: Scenario, result: AgentResult) -> dict[str, Any]:
-    """Greedily remove turns and trace events while preserving a failure category.
+def _input_reductions(value: Any, prefix: str = ""):
+    """Yield smaller mappings by deleting fields or one whitespace token at a time."""
+    if isinstance(value, dict):
+        for key, item in value.items():
+            path = f"{prefix}.{key}" if prefix else str(key)
+            if len(value) > 1:
+                candidate = dict(value)
+                del candidate[key]
+                yield path, candidate, "field_removed"
+            if isinstance(item, str):
+                words = item.split()
+                for index in range(len(words)):
+                    candidate = dict(value)
+                    candidate[key] = " ".join(words[:index] + words[index + 1:])
+                    yield path, candidate, "text_reduced"
+            elif isinstance(item, (dict, list)):
+                for child_path, reduced, kind in _input_reductions(item, path):
+                    candidate = dict(value)
+                    candidate[key] = reduced
+                    yield child_path, candidate, kind
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            path = f"{prefix}[{index}]"
+            if len(value) > 1:
+                yield path, value[:index] + value[index + 1:], "item_removed"
+            if isinstance(item, str):
+                words = item.split()
+                for word_index in range(len(words)):
+                    candidate = list(value)
+                    candidate[index] = " ".join(words[:word_index] + words[word_index + 1:])
+                    yield path, candidate, "text_reduced"
+            elif isinstance(item, (dict, list)):
+                for child_path, reduced, kind in _input_reductions(item, path):
+                    candidate = list(value)
+                    candidate[index] = reduced
+                    yield child_path, candidate, kind
+
+
+def _input_digest(value: Any) -> str:
+    encoded = json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":"), default=str)
+    return sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def minimize_failure(
+    scenario: Scenario, result: AgentResult, *,
+    replay: Callable[[Scenario], AgentResult] | None = None,
+) -> dict[str, Any]:
+    """Greedily remove turns, inputs, and optionally recorded trace events.
 
     Reduction is deterministic and yields a 1-minimal result: no remaining single
-    turn or event can be removed while retaining the selected diagnostic category.
-    The already captured agent trace is scored locally; no provider is called.
+    turn or input field/token can be removed during replay while retaining the
+    selected failure category. Without replay, reductions are local and include
+    ordered trace events without another provider call.
     """
     if result.scenario != scenario.name:
         raise MinimizeError(f"result scenario '{result.scenario}' does not match '{scenario.name}'")
@@ -54,9 +104,28 @@ def minimize_failure(scenario: Scenario, result: AgentResult) -> dict[str, Any]:
         score = _score(candidate_scenario, candidate_result)
         return not score.passed and any(item.category == target_category for item in score.diagnostics)
 
+    replay_attempts = 0
+
+    def replayed(candidate: Scenario) -> AgentResult:
+        nonlocal replay_attempts
+        replay_attempts += 1
+        assert replay is not None
+        return replay(candidate)
+
     current_scenario, current_result = scenario, result
+    original_reproduced = None
+    if replay is not None:
+        try:
+            current_result = replayed(scenario)
+            original_reproduced = reproduces(scenario, current_result)
+        except Exception:
+            original_reproduced = False
+        if not original_reproduced:
+            raise MinimizeError("original failure did not reproduce with the selected runner")
+
     removed_turns: list[int] = []
     removed_events: list[dict[str, Any]] = []
+    input_reductions: list[dict[str, Any]] = []
 
     # A scenario turn and its observed result are one indivisible reduction unit.
     original_indices = list(range(1, min(len(scenario.turns), len(result.turns)) + 1))
@@ -71,12 +140,56 @@ def minimize_failure(scenario: Scenario, result: AgentResult) -> dict[str, Any]:
             candidate_scenario = replace(current_scenario, turns=scenario_turns,
                                          input=scenario_turns[0].input)
             candidate_result = _aggregate(candidate_scenario, observed_turns, current_result)
+            if replay is not None:
+                try:
+                    candidate_result = replayed(candidate_scenario)
+                except Exception:
+                    continue
             if reproduces(candidate_scenario, candidate_result):
                 kept_indices = proposed_indices
                 current_scenario, current_result = candidate_scenario, candidate_result
                 removed_turns.append(index)
                 changed = True
                 break
+
+    if replay is not None:
+        changed = True
+        while changed:
+            changed = False
+            reductions = []
+            if current_scenario.turns:
+                for turn_index, turn in enumerate(current_scenario.turns):
+                    reductions.extend((turn_index, path, reduced, kind)
+                                      for path, reduced, kind in _input_reductions(turn.input))
+            else:
+                reductions.extend((None, path, reduced, kind)
+                                  for path, reduced, kind in _input_reductions(current_scenario.input))
+            for turn_index, path, reduced_input, kind in reductions:
+                turns = list(current_scenario.turns)
+                before_input = current_scenario.input if turn_index is None else turns[turn_index].input
+                if turn_index is None:
+                    candidate_scenario = replace(current_scenario, input=reduced_input)
+                else:
+                    turns[turn_index] = replace(turns[turn_index], input=reduced_input)
+                    candidate_scenario = replace(current_scenario, turns=tuple(turns),
+                                                 input=turns[0].input)
+                before_digest = _input_digest(before_input)
+                after_digest = _input_digest(reduced_input)
+                try:
+                    candidate_result = replayed(candidate_scenario)
+                except Exception:
+                    continue
+                if reproduces(candidate_scenario, candidate_result):
+                    current_scenario, current_result = candidate_scenario, candidate_result
+                    input_reductions.append({
+                        "turn": turn_index + 1 if turn_index is not None else None,
+                        "path": path, "kind": kind,
+                        "before_fingerprint": before_digest, "after_fingerprint": after_digest,
+                    })
+                    changed = True
+                    break
+                if changed:
+                    break
 
     if not current_result.turns and (current_result.events or current_result.asked or current_result.actions):
         # Older canonical JSONL captures may have aggregate fields but no nested
@@ -94,7 +207,7 @@ def minimize_failure(scenario: Scenario, result: AgentResult) -> dict[str, Any]:
     turn_event_positions: list[tuple[int, int]] = []
     for turn_index, turn in enumerate(current_result.turns):
         turn_event_positions.extend((turn_index, event_index) for event_index in range(len(turn.events)))
-    changed = True
+    changed = replay is None
     while changed:
         changed = False
         for turn_index, event_index in tuple(turn_event_positions):
@@ -139,10 +252,17 @@ def minimize_failure(scenario: Scenario, result: AgentResult) -> dict[str, Any]:
         "target_failure_category": target_category,
         "original_failure_categories": sorted(categories),
         "reproduction_verified": True,
-        "minimality": "1-minimal under single-turn and single-event deletion",
+        "minimality": ("1-minimal under single-turn, input-field, and text-token reduction"
+                       if replay is not None else
+                       "1-minimal under single-turn and single-event deletion"),
         "kept_turns": kept_indices,
         "removed_turns": sorted(removed_turns),
+        "input_reductions": input_reductions,
         "removed_events": removed_events,
+        "replay": ({"enabled": True, "verified": True,
+                    "attempts": replay_attempts, "original_reproduced": original_reproduced}
+                   if replay is not None else {"enabled": False, "verified": True, "attempts": 0}),
+        "scoring_mode": "deterministic; semantic judge graders skipped",
         "original_size": {"turns": len(result.turns),
                           "events": sum(len(turn.events) for turn in result.turns) or len(result.events)},
         "minimized_size": {"turns": len(current_result.turns), "events": sum(len(turn.events) for turn in current_result.turns)},

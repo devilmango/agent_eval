@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import asdict
+from datetime import datetime, timezone
 from importlib.metadata import entry_points
 from inspect import Parameter, signature
 import hashlib
@@ -12,7 +13,6 @@ import json
 import os
 from pathlib import Path
 import tempfile
-from datetime import datetime, timezone
 from threading import BoundedSemaphore, Event, local
 from time import monotonic, perf_counter
 from typing import Any, Protocol
@@ -36,10 +36,12 @@ class RunCancelled(RunnerError):
 class ExecutionControl:
     """Cooperative cancellation/deadline handle injected into supporting runners."""
 
-    def __init__(self, scenario: str, cancel_event: Event, timeout: float | None):
+    def __init__(self, scenario: str, cancel_event: Event, timeout: float | None,
+                 seed: int | None = None):
         self.scenario = scenario
         self.cancel_event = cancel_event
         self.deadline = monotonic() + timeout if timeout is not None else None
+        self.seed = seed
 
     @property
     def cancelled(self) -> bool:
@@ -156,7 +158,7 @@ def execute_scenarios(
     runner_key: str | None = None, runner_factory: Callable[[], AgentRunner] | None = None,
     stats: dict[str, int] | None = None, provider_key: str | None = None,
     provider_limits: Mapping[str, int] | None = None, scenario_timeout: float | None = None,
-    cancel_event: Event | None = None,
+    cancel_event: Event | None = None, seed: int | None = None,
 ) -> list[AgentResult]:
     """Execute scenarios concurrently with limits, deadlines, resume, and cache support.
 
@@ -170,6 +172,8 @@ def execute_scenarios(
                                          or not isinstance(scenario_timeout, (int, float))
                                          or scenario_timeout <= 0):
         raise RunnerError("scenario_timeout must be a positive number")
+    if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
+        raise RunnerError("seed must be an integer")
     limits = dict(provider_limits or {})
     for name, limit in limits.items():
         if not isinstance(name, str) or not name:
@@ -179,7 +183,7 @@ def execute_scenarios(
     names = [scenario.name for scenario in scenarios]
     if len(names) != len(set(names)):
         raise RunnerError("scenario names must be unique for execution checkpoints")
-    identity = runner_key or _runner_key(runner)
+    identity = execution_runner_key(runner_key or _runner_key(runner), seed)
     if checkpoint and cache and checkpoint.resolve() == cache.resolve():
         raise RunnerError("checkpoint and cache paths must be different")
     checkpoint_state = _read_state(checkpoint, identity) if checkpoint else _empty_state(identity)
@@ -216,7 +220,7 @@ def execute_scenarios(
         provider = str(getattr(active_runner, "provider", None)
                        or provider_key or _runner_key(active_runner))
         limiter = limiters.get(provider)
-        control = ExecutionControl(scenario.name, stop, scenario_timeout)
+        control = ExecutionControl(scenario.name, stop, scenario_timeout, seed=seed)
         if limiter is not None:
             while not limiter.acquire(timeout=0.05):
                 control.raise_if_cancelled()
@@ -331,6 +335,8 @@ def _execute_scenario(
         history.append(_coerce_turn(value, scenario.name, index))
     metadata: dict[str, Any] = {"latency_ms": round((perf_counter() - started) * 1000, 3),
                                 "tool_fixture_calls": len(sandbox.calls)}
+    if control is not None and control.seed is not None:
+        metadata["evaluation_seed"] = control.seed
     for field_name in ("input_tokens", "output_tokens", "cost_usd"):
         values = [turn.metadata[field_name] for turn in history
                   if isinstance(turn.metadata.get(field_name), (int, float))]
@@ -356,6 +362,11 @@ def _execute_scenario(
 def _runner_key(runner: AgentRunner) -> str:
     cls = type(runner)
     return f"{cls.__module__}.{cls.__qualname__}@{getattr(runner, 'version', 'unspecified')}"
+
+
+def execution_runner_key(runner_key: str, seed: int | None = None) -> str:
+    """Include explicit randomness in cache identity to avoid cross-seed reuse."""
+    return f"{runner_key}#seed={seed}" if seed is not None else runner_key
 
 
 def _scenario_fingerprint(scenario: Scenario) -> str:

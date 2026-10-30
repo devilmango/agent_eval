@@ -37,6 +37,7 @@ from agent_eval.history import (HistoryError, compare_history, filter_history, h
                                 text_history_comparison, text_trend_report, trend_report)
 from agent_eval.history_gates import (evaluate_history_gates, load_history_gate_profile,
                                       text_history_gate_report)
+from agent_eval.investigation import investigate_failed_scenarios
 from agent_eval.models import AgentResult
 from agent_eval.monitoring import (drift_report, experiment_matrix, github_annotation_report,
                                    github_scenario_impact_report, read_variant_spec)
@@ -44,6 +45,7 @@ from agent_eval.minimize import MinimizeError, minimize_failure
 from agent_eval.otel import OpenTelemetryAdapter, load_otel_document
 from agent_eval.portable_baseline import (PortableBaselineError, export_portable_baseline,
                                           import_portable_baseline)
+from agent_eval.provenance import attach_provenance, compare_result_provenance, provenance_manifest
 from agent_eval.quality import failure_analysis, mutation_report, scenario_coverage, scenario_suggestions, judge_agreement, text_coverage, text_mutation_report, text_failure_analysis
 from agent_eval.report import (html_report, json_report, junit_report, repeated_html_report,
                                sarif_report, text_report)
@@ -54,7 +56,7 @@ from agent_eval.redaction import (
 from agent_eval.robustness import VARIANT_TYPES, run_robustness
 from agent_eval.repeated import analyze_repeated_runs, text_repeated_report
 from agent_eval.results import ResultError, load_results
-from agent_eval.runner import RunnerError, execute_scenarios, load_runner
+from agent_eval.runner import RunnerError, execute_scenarios, execution_runner_key, load_runner
 from agent_eval.scenarios import ScenarioError, filter_scenarios, load_scenarios
 from agent_eval.scoring import evaluate
 from agent_eval.scenario_audit import audit_scenarios, text_scenario_audit
@@ -123,6 +125,8 @@ def build_parser() -> argparse.ArgumentParser:
     compare.add_argument("--confidence", type=float, default=0.95, help="paired bootstrap confidence level (default: 0.95)")
     compare.add_argument("--bootstrap-samples", type=int, default=2000, help="paired bootstrap resamples (minimum: 100)")
     compare.add_argument("--seed", type=int, default=0, help="bootstrap random seed for reproducible intervals")
+    compare.add_argument("--provenance-policy", choices=("ignore", "warn", "strict"), default="warn",
+                         help="warn about or block comparisons with incompatible provenance")
     compare.add_argument("--github-annotations", action="store_true", help="emit GitHub Actions error annotations for regressed scenarios")
     compare.add_argument("--summary-file", type=Path, help="append a Markdown summary (defaults to GITHUB_STEP_SUMMARY when set)")
     _add_tag_filters(compare)
@@ -269,6 +273,10 @@ def build_parser() -> argparse.ArgumentParser:
                            help="reuse matching results across runs from this incremental cache")
     run_agent.add_argument("--check-cache", action="store_true",
                            help="check cache format and runner identity before executing")
+    run_agent.add_argument("--seed", type=int,
+                           help="reproducible seed exposed to runners through execution_control")
+    run_agent.add_argument("--provenance-manifest", type=Path,
+                           help="write a sidecar manifest of per-scenario provenance fingerprints")
     run_agent.add_argument("--provider-limit", action="append", default=[], metavar="PROVIDER=N",
                            help="cap simultaneous calls for a provider (repeatable)")
     run_agent.add_argument("--scenario-timeout", type=float,
@@ -297,6 +305,7 @@ def build_parser() -> argparse.ArgumentParser:
         cache_detail.add_argument("cache_file", type=Path)
         cache_detail.add_argument("scenarios", type=Path, help="scenario YAML file or directory")
         cache_detail.add_argument("--runner-key", required=True, help="same runner identity used by run-agent")
+        cache_detail.add_argument("--seed", type=int, help="explicit run seed, if one was used")
         cache_detail.add_argument("--format", choices=("text", "json"), default="text")
         cache_detail.add_argument("--output", type=Path)
     cache_prune = cache_commands.add_parser("prune", help="remove entries older than a specified age")
@@ -313,6 +322,20 @@ def build_parser() -> argparse.ArgumentParser:
     minimize.add_argument("--responses", required=True, type=Path, help="canonical JSONL results from the failing run")
     minimize.add_argument("--scenario", required=True, help="scenario name to minimize")
     minimize.add_argument("--output", type=Path, help="write the minimized reproduction report to a JSON file")
+    minimize.add_argument("--runner", help="rerun reductions through this installed runner")
+    minimize.add_argument("--seed", type=int, default=0, help="seed passed to replay-aware runners (default: 0)")
+    minimize.add_argument("--scenario-timeout", type=float, help="per-attempt timeout for replay runs")
+
+    investigate = commands.add_parser("investigate", help="rerun failed scenarios to classify reproducibility")
+    investigate.add_argument("scenarios", type=Path, help="scenario YAML file or directory")
+    investigate.add_argument("--responses", required=True, type=Path, help="baseline JSONL containing failed results")
+    investigate.add_argument("--runner", required=True, help="runner entry-point name")
+    investigate.add_argument("--repetitions", type=int, default=5, help="reruns per failed scenario (minimum: 2)")
+    investigate.add_argument("--seed", type=int, default=0, help="first deterministic rerun seed")
+    investigate.add_argument("--scenario-timeout", type=float, help="per-attempt timeout in seconds")
+    investigate.add_argument("--format", choices=("text", "json"), default="text")
+    investigate.add_argument("--output", type=Path)
+    _add_tag_filters(investigate)
 
     shard = commands.add_parser("shard", help="write a deterministic manifest for distributed scenario execution")
     shard.add_argument("scenarios", type=Path, help="scenario YAML file or directory")
@@ -541,7 +564,10 @@ def main(argv: list[str] | None = None) -> int:
                 return 0
             if args.cache_command in {"check", "explain"}:
                 requested_scenarios = load_scenarios(args.scenarios)
-                report = explain_cache(args.cache_file, requested_scenarios, runner_key=args.runner_key)
+                report = explain_cache(
+                    args.cache_file, requested_scenarios,
+                    runner_key=execution_runner_key(args.runner_key, args.seed),
+                )
                 if args.format == "json":
                     rendered = json.dumps(report, indent=2, ensure_ascii=False)
                 else:
@@ -568,6 +594,8 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.command == "minimize":
+            if args.scenario_timeout is not None and args.scenario_timeout <= 0:
+                raise ValueError("--scenario-timeout must be positive")
             scenario_rows = load_scenarios(args.scenarios)
             scenario = next((item for item in scenario_rows if item.name == args.scenario), None)
             if scenario is None:
@@ -576,7 +604,18 @@ def main(argv: list[str] | None = None) -> int:
             result = results.get(args.scenario)
             if result is None:
                 raise MinimizeError(f"no recorded result for scenario '{args.scenario}'")
-            report = minimize_failure(scenario, result)
+            replay = None
+            if args.runner:
+                load_runner(args.runner)  # validate the plugin before entering the reducer
+
+                def replay(candidate):
+                    runner = load_runner(args.runner)
+                    [replayed_result] = execute_scenarios(
+                        [candidate], runner, scenario_timeout=args.scenario_timeout, seed=args.seed,
+                    )
+                    return replayed_result
+
+            report = minimize_failure(scenario, result, replay=replay)
             _write_output(args.output, json.dumps(report, indent=2, ensure_ascii=False))
             return 0
 
@@ -1157,13 +1196,24 @@ def main(argv: list[str] | None = None) -> int:
             elif args.shard_index is not None:
                 raise ShardError("--shard-index requires --shard-manifest")
         if args.command == "compare":
+            baseline_results = _selected_results(args.baseline, all_scenarios, scenarios)
+            candidate_results = _selected_results(args.candidate, all_scenarios, scenarios)
             baseline = evaluate(
-                scenarios, _selected_results(args.baseline, all_scenarios, scenarios), strict=args.strict
+                scenarios, baseline_results, strict=args.strict
             )
             candidate = evaluate(
-                scenarios, _selected_results(args.candidate, all_scenarios, scenarios), strict=args.strict
+                scenarios, candidate_results, strict=args.strict
             )
             comparison = compare_reports(baseline, candidate)
+            provenance_failed = False
+            if args.provenance_policy != "ignore":
+                provenance = compare_result_provenance(baseline_results, candidate_results)
+                comparison["provenance"] = provenance
+                comparison["provenance_policy"] = args.provenance_policy
+                provenance_failed = args.provenance_policy == "strict" and not provenance["compatible"]
+                if args.provenance_policy == "warn":
+                    for warning in provenance["warnings"]:
+                        print(f"agent-eval: provenance warning: {warning}", file=sys.stderr)
             comparison["paired_bootstrap"] = paired_bootstrap_intervals(
                 baseline, candidate, confidence=args.confidence,
                 samples=args.bootstrap_samples, seed=args.seed,
@@ -1178,12 +1228,12 @@ def main(argv: list[str] | None = None) -> int:
                         handle.write(summary)
                 elif not annotations:
                     print(summary)
-                return 0 if not comparison["regressed_scenarios"] else 1
+                return 0 if not comparison["regressed_scenarios"] and not provenance_failed else 1
             if args.format == "json":
                 print(json.dumps(comparison, indent=2, ensure_ascii=False))
             else:
                 print(text_comparison(comparison))
-            return 0 if not comparison["regressed_scenarios"] else 1
+            return 0 if not comparison["regressed_scenarios"] and not provenance_failed else 1
 
         if args.command == "monitor":
             if not 0 <= args.max_absolute_drift <= 1:
@@ -1286,6 +1336,29 @@ def main(argv: list[str] | None = None) -> int:
                 )
             return 0 if gate_passed else 1
 
+        if args.command == "investigate":
+            if args.repetitions < 2:
+                raise ValueError("--repetitions must be at least 2")
+            runner = load_runner(args.runner)
+            baseline_results = _selected_results(args.responses, all_scenarios, scenarios)
+            report = investigate_failed_scenarios(
+                scenarios, baseline_results, runner, repetitions=args.repetitions,
+                seed=args.seed, scenario_timeout=args.scenario_timeout,
+                runner_factory=lambda: load_runner(args.runner),
+            )
+            if args.format == "json":
+                rendered = json.dumps(report, indent=2, ensure_ascii=False)
+            else:
+                lines = [f"Failure investigation: {report['scenario_count']} failed scenario(s)",
+                         f"Reruns: {report['repetitions']}; base seed: {report['base_seed']}",
+                         f"Seed delivered through execution_control: {report['runner_accepts_execution_control']}", ""]
+                for item in report["scenarios"]:
+                    lines.append(f"{item['classification'].upper()} {item['scenario']}: "
+                                 f"{item['passed_runs']} passed, {item['failed_runs']} failed")
+                rendered = "\n".join(lines).rstrip()
+            _write_output(args.output, rendered)
+            return 0
+
         if args.command == "run-agent":
             runner = load_runner(args.runner)
             execution_stats: dict[str, int] = {}
@@ -1293,8 +1366,10 @@ def main(argv: list[str] | None = None) -> int:
             if args.check_cache:
                 if args.cache is None:
                     raise RunnerError("--check-cache requires --cache")
-                preflight = explain_cache(args.cache, scenarios,
-                                          runner_key=f"{args.runner}@{runner_version}")
+                preflight = explain_cache(
+                    args.cache, scenarios,
+                    runner_key=execution_runner_key(f"{args.runner}@{runner_version}", args.seed),
+                )
                 print(json.dumps(preflight, indent=2, ensure_ascii=False), file=sys.stderr)
                 if not preflight["compatible"]:
                     raise RunnerError("cache preflight failed: runner identity does not match")
@@ -1318,6 +1393,7 @@ def main(argv: list[str] | None = None) -> int:
                     stats=execution_stats, provider_key=args.runner,
                     provider_limits=_parse_provider_limits(args.provider_limit),
                     scenario_timeout=args.scenario_timeout, cancel_event=cancel_event,
+                    seed=args.seed,
                 )
             except RunnerError as exc:
                 if not hasattr(exc, "partial_results"):
@@ -1328,10 +1404,27 @@ def main(argv: list[str] | None = None) -> int:
             finally:
                 for signum, handler in previous_handlers.items():
                     signal.signal(signum, handler)
+            runner_key = f"{args.runner}@{runner_version}"
+            evaluation_config = {
+                "command": "run-agent", "seed": args.seed, "workers": args.workers,
+                "provider_limits": _parse_provider_limits(args.provider_limit),
+                "scenario_timeout": args.scenario_timeout,
+                "selected_scenarios": [scenario.name for scenario in scenarios],
+                "judge_repetitions": args.judge_repetitions,
+                "budgets": {"max_cost_usd": args.max_cost_usd,
+                            "max_input_tokens": args.max_input_tokens,
+                            "max_output_tokens": args.max_output_tokens,
+                            "max_p95_latency_ms": args.max_p95_latency_ms},
+            }
+            results = attach_provenance(scenarios, results, runner_key=runner_key,
+                                        evaluation_config=evaluation_config)
             args.results.write_text(
                 "".join(json.dumps(result_as_dict(result), ensure_ascii=False) + "\n" for result in results),
                 encoding="utf-8",
             )
+            if args.provenance_manifest:
+                _write_output(args.provenance_manifest,
+                              json.dumps(provenance_manifest(results), indent=2, ensure_ascii=False))
             report = evaluate(scenarios, {result.scenario: result for result in results}, strict=not execution_stats.get("cancelled", 0) and not execution_failed,
                               judge_cache=args.judge_cache, judge_repetitions=args.judge_repetitions)
             report.execution["agent_execution"] = execution_stats
@@ -1347,6 +1440,7 @@ def main(argv: list[str] | None = None) -> int:
                                "selected_scenarios": [item.name for item in scenarios],
                                "execution": execution_stats,
                                "workers": args.workers,
+                               "seed": args.seed,
                                "scenario_timeout": args.scenario_timeout,
                                "provider_limits": _parse_provider_limits(args.provider_limit),
                                "shard_index": args.shard_index,

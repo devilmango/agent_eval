@@ -13,6 +13,7 @@ from typing import Any
 from agent_eval import __version__
 from agent_eval.adapters import result_as_dict
 from agent_eval.models import AgentResult, EvaluationReport, Scenario
+from agent_eval.provenance import provenance_manifest
 from agent_eval.results import load_results
 from agent_eval.scenarios import load_scenarios
 from agent_eval.scoring import evaluate
@@ -72,6 +73,8 @@ def create_bundle(
         result_text = "".join(json.dumps(result_as_dict(result), ensure_ascii=False) + "\n"
                               for result in ordered_results)
         (temporary / "results.jsonl").write_text(result_text, encoding="utf-8")
+        if any(isinstance(result.metadata.get("provenance"), dict) for result in ordered_results):
+            _write_json(temporary / "provenance-manifest.json", provenance_manifest(ordered_results))
         _write_json(temporary / "report.json", report.as_dict())
         snapshot_data = scenario_snapshot(scenarios, source_root)
         _write_json(temporary / "scenario-snapshot.json", snapshot_data)

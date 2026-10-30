@@ -15,6 +15,9 @@ The core package has no model-provider or agent-framework dependency. Optional r
 - **Unnecessary questions** — how often did it ask for information outside the required or allowed question set?
 - **Scenario pass rate** — did each scenario satisfy all of its declared checks?
 - **Run-to-run stability** — how consistent are those scores across repeated agent executions?
+- **Failure reproducibility** — are observed failures consistent, intermittent, or unreproduced on seeded reruns?
+- **Evaluation provenance** — can a baseline comparison verify that scenarios and evaluation settings match?
+- **Replay-backed minimization** — can an agent reproduce a failure after its input and conversation turns are reduced?
 - **HTML reports** — can reviewers inspect a run or repeated-run analysis in a browser?
 - **CI report exports** — publish scenario results as JUnit XML or SARIF 2.1.0 in test reporting and code-scanning pipelines.
 - **Multi-turn conversations** — can expectations be checked across turns while preserving order?
@@ -195,6 +198,10 @@ agent-eval cache prune .agent-eval/cache.json --older-than-days 30 --dry-run
 agent-eval cache prune .agent-eval/cache.json --older-than-days 30
 ```
 
+If a run used `run-agent --seed N`, pass `--seed N` to cache `check` or `explain`
+as well. Seeded executions have a distinct cache identity, preventing results
+from one random seed from being reused for another.
+
 Minimize a failed captured multi-turn result locally, without calling the agent
 provider again:
 
@@ -209,6 +216,22 @@ Reduction is deterministic and 1-minimal under single-turn and single-event
 deletion: no remaining individual turn or event can be removed while preserving
 the selected diagnostic category. Semantic judge calls are skipped during this
 local reduction, so use it for failures reproducible by deterministic graders.
+
+To verify a smaller behavioral reproduction against the runner, pass `--runner`.
+Agent Eval first replays the original failure, then reruns reduced turn sequences
+and inputs. Replays use a fresh cache-free execution and preserve the original
+failure category:
+
+```bash
+agent-eval minimize scenarios/ --responses run.jsonl \
+  --scenario appointment_reschedule --runner my-agent --seed 17 \
+  --scenario-timeout 45 --output replay-minimized.json
+```
+
+The runner can read `execution_control.seed`; agents that do not accept the
+execution control still rerun, but cannot consume the seed. The report includes
+the replay count and confirms that both the original and minimized inputs
+reproduced the failure.
 
 Provider limits are keyed by the runner's `provider` attribute; if it has none,
 the `--runner` entry-point name is used. Repeat `--provider-limit PROVIDER=N`
@@ -711,6 +734,23 @@ agent-eval compare scenarios/ \
 
 The command uses `GITHUB_STEP_SUMMARY` when available; pass `--summary-file path.md` to select a summary file explicitly. Each regressed scenario becomes an `::error` annotation, and the command keeps the normal regression exit status so it can gate a pull request.
 
+`run-agent` attaches provenance fingerprints to every captured result's
+metadata, including scenario, runner, model, prompt, tool fixtures, and the
+evaluation settings. Use `--provenance-manifest path.json` to write a compact
+sidecar manifest. Run bundles include the same manifest automatically. When
+comparing results, `--provenance-policy warn` (the default) reports missing or
+changed fingerprints; `--provenance-policy strict` also fails comparisons when
+scenario or evaluation-protocol inputs are incompatible. Runner, model, and
+prompt changes are reported as comparison dimensions because those often are
+the intended candidate differences:
+
+```bash
+agent-eval run-agent scenarios/ --runner my-agent --seed 17 \
+  --results candidate.jsonl --provenance-manifest candidate.provenance.json
+agent-eval compare scenarios/ --baseline baseline.jsonl --candidate candidate.jsonl \
+  --provenance-policy strict --format json
+```
+
 Monitor a sampled production trace batch against a known-good canonical JSONL baseline:
 
 ```bash
@@ -772,6 +812,24 @@ agent-eval repeat scenarios/ --runs runs/*.jsonl \
 ```
 
 The interval measures uncertainty in the aggregate scenario pass proportion, assuming each scenario result is a Bernoulli outcome. It does not correct for correlated runs, scenario selection bias, or incomplete scenario coverage. Choose a run count and threshold appropriate to the risk; a small sample can have a wide interval even with no observed failures.
+
+Investigate failures automatically by rerunning only scenarios that failed in a
+baseline capture. Each repetition uses the next integer seed. Results are
+classified as `consistent` when every rerun fails, `intermittent` when reruns
+mix passes and failures, or `unreproduced` when every rerun passes:
+
+```bash
+agent-eval investigate scenarios/ --responses failing-run.jsonl \
+  --runner my-agent --repetitions 8 --seed 100 --format json \
+  --output failure-investigation.json
+```
+
+The report records each seed, outcome, and failure category. Seed control is
+delivered through `execution_control.seed`; the report says whether the runner
+accepts that argument. Investigation bypasses result caches so each attempt
+executes the agent again. The rerun classification uses deterministic graders
+and skips semantic judge graders so judge variability does not get mixed into
+agent flakiness.
 
 ### Filter by scenario tags
 
