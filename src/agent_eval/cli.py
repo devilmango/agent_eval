@@ -28,9 +28,10 @@ from agent_eval.budgets import apply_budgets
 from agent_eval.comparison import compare_reports, paired_bootstrap_intervals, text_comparison
 from agent_eval.drafts import (
     DraftError, create_minimized_failure_draft, create_scenario_drafts, list_scenario_drafts,
-    promote_scenario_draft, review_scenario_draft,
+    promote_scenario_draft, review_scenario_draft, verify_minimized_failure_draft,
 )
-from agent_eval.conformance import check_grader_conformance, check_runner_conformance
+from agent_eval.conformance import (check_grader_conformance, check_runner_conformance,
+                                    run_conformance_matrix)
 from agent_eval.gate_profiles import GateProfileError, evaluate_release_gates, load_gate_profile, text_release_gate_report
 from agent_eval.graders import GraderError, load_grader_registry, load_judge_registry
 from agent_eval.history import (HistoryError, compare_history, filter_history, html_history_comparison,
@@ -240,6 +241,8 @@ def build_parser() -> argparse.ArgumentParser:
     draft_promote.add_argument("draft", type=Path)
     draft_promote.add_argument("--output-dir", required=True, type=Path)
     draft_promote.add_argument("--allow-duplicate", action="store_true", help="allow promotion after reviewing an exact-input duplicate")
+    draft_verify = draft_commands.add_parser("verify", help="verify hashes for attached minimized-failure evidence")
+    draft_verify.add_argument("draft", type=Path)
 
     gate = commands.add_parser("gate", help="apply risk-based release thresholds to one or more runs")
     gate.add_argument("scenarios", type=Path, help="scenario YAML file or directory")
@@ -342,8 +345,22 @@ def build_parser() -> argparse.ArgumentParser:
     conformance.add_argument("name", help="installed runner or grader entry-point name")
     conformance.add_argument("--config-json", default="{}", help="grader probe config as a JSON object")
     conformance.add_argument("--answer", default="Conformance probe", help="grader probe answer")
+    conformance.add_argument("--suite", type=Path, help="YAML fixture suite with cases and expected outputs")
     conformance.add_argument("--format", choices=("text", "json"), default="text")
     conformance.add_argument("--output", type=Path, help="write the conformance report to a file")
+
+    conformance_matrix = commands.add_parser(
+        "conformance-matrix", help="run plugin conformance fixtures across Python and Agent Eval environments",
+    )
+    conformance_matrix.add_argument("plugin_type", choices=("runner", "grader"))
+    conformance_matrix.add_argument("name", help="installed runner or grader entry-point name")
+    conformance_matrix.add_argument("--suite", required=True, type=Path, help="fixture suite YAML")
+    conformance_matrix.add_argument("--targets", required=True, type=Path, help="YAML list of Python environments")
+    conformance_matrix.add_argument("--timeout", type=float, default=120, help="maximum seconds per target process")
+    conformance_matrix.add_argument("--grader-config-json", help="grader probe config applied in each environment")
+    conformance_matrix.add_argument("--grader-answer", help="grader probe answer applied in each environment")
+    conformance_matrix.add_argument("--format", choices=("text", "json"), default="text")
+    conformance_matrix.add_argument("--output", type=Path, help="write the compatibility matrix to a file")
 
     investigate = commands.add_parser("investigate", help="rerun failed scenarios to classify reproducibility")
     investigate.add_argument("scenarios", type=Path, help="scenario YAML file or directory")
@@ -652,7 +669,7 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "conformance":
             if args.plugin_type == "runner":
-                report = check_runner_conformance(load_runner(args.name))
+                report = check_runner_conformance(load_runner(args.name), suite=args.suite)
             else:
                 try:
                     config = json.loads(args.config_json)
@@ -664,13 +681,44 @@ def main(argv: list[str] | None = None) -> int:
                 grader = graders.get(args.name)
                 if grader is None:
                     raise GraderError(f"unknown grader '{args.name}' (available: {', '.join(sorted(graders))})")
-                report = check_grader_conformance(grader, config=config, answer=args.answer)
+                report = check_grader_conformance(grader, config=config, answer=args.answer, suite=args.suite)
             if args.format == "json":
                 rendered = json.dumps(report, indent=2, ensure_ascii=False)
             else:
                 lines = [f"{args.plugin_type.title()} conformance: {'PASS' if report['passed'] else 'FAIL'}"]
                 lines.extend(f"  {item['status'].upper():>6}  {item['name']}: {item['detail']}"
                              for item in report["checks"])
+                rendered = "\n".join(lines)
+            _write_output(args.output, rendered)
+            return 0 if report["passed"] else 1
+
+        if args.command == "conformance-matrix":
+            grader_config = None
+            if args.grader_config_json is not None:
+                try:
+                    grader_config = json.loads(args.grader_config_json)
+                except json.JSONDecodeError as exc:
+                    raise ValueError(f"--grader-config-json is not valid JSON: {exc.msg}") from exc
+                if not isinstance(grader_config, dict):
+                    raise ValueError("--grader-config-json must decode to a JSON object")
+            report = run_conformance_matrix(
+                args.plugin_type, args.name, args.suite, args.targets,
+                timeout_seconds=args.timeout, grader_config=grader_config,
+                grader_answer=args.grader_answer,
+            )
+            if args.format == "json":
+                rendered = json.dumps(report, indent=2, ensure_ascii=False)
+            else:
+                lines = [f"Conformance matrix: {'PASS' if report['passed'] else 'FAIL'}",
+                         f"Plugin: {report['plugin_type']} {report['plugin']}"]
+                for target in report["targets"]:
+                    version = (f"Python {target.get('python_version', '?')} / "
+                               f"Agent Eval {target.get('agent_eval_version', '?')}")
+                    lines.append(f"  {target['status'].upper():>6}  {target['name']}: {version}")
+                    if target.get("error"):
+                        lines.append(f"         {target['error']}")
+                for capability, outcome in report["capability_matrix"].items():
+                    lines.append(f"  {capability}: {len(outcome['passed'])} passed, {len(outcome['failed'])} failed")
                 rendered = "\n".join(lines)
             _write_output(args.output, rendered)
             return 0 if report["passed"] else 1
@@ -802,6 +850,10 @@ def main(argv: list[str] | None = None) -> int:
                     args.draft, status=args.status, reviewer=args.reviewer, notes=args.notes,
                 )
                 print(json.dumps(reviewed, indent=2, ensure_ascii=False))
+                return 0
+            if args.draft_command == "verify":
+                verification = verify_minimized_failure_draft(args.draft)
+                print(json.dumps({"file": str(args.draft), **verification}, indent=2, ensure_ascii=False))
                 return 0
             promoted = promote_scenario_draft(
                 args.draft, args.output_dir, allow_duplicate=args.allow_duplicate,

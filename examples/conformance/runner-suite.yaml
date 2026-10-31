@@ -1,0 +1,52 @@
+schema_version: 1
+plugin_type: runner
+cases:
+  - name: fixture-backed-lookup
+    scenario:
+      scenario: conformance_lookup
+      input:
+        user: "What are today's hours?"
+        conformance_case: lookup
+      expected:
+        intent: HOURS
+      tool_fixtures:
+        - name: lookup_hours
+          arguments:
+            location: demo
+          response:
+            answer: "Open until five."
+    expected_trace:
+      intent: HOURS
+      tools: [lookup_hours]
+      tool_calls:
+        - name: lookup_hours
+          arguments:
+            location: demo
+      events:
+        - type: action
+          name: lookup_hours
+      answer: "Open until five."
+
+  - name: malformed-result-is-rejected
+    scenario:
+      scenario: conformance_malformed
+      input:
+        user: "Return the malformed-output fixture."
+        conformance_case: malformed
+      expected:
+        intent: HOURS
+    expect_error:
+      type: RunnerError
+      contains: "AgentTurnResult"
+
+  - name: cooperative-mid-run-cancellation
+    scenario:
+      scenario: conformance_cancellation
+      input:
+        user: "Wait until the harness cancels this call."
+        conformance_case: cancellation
+      expected:
+        intent: HOURS
+    cancellation:
+      after_start_ms: 25
+      timeout_seconds: 3

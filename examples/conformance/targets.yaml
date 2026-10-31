@@ -1,0 +1,10 @@
+schema_version: 1
+grader_config:
+  values: ["supported"]
+grader_answer: "Conformance probe is supported."
+targets:
+  - name: local-python
+    python: python
+    # Optional exact-version gates. Uncomment and adjust for each environment.
+    # python_version: "3.12"
+    # agent_eval_version: "0.1.0"

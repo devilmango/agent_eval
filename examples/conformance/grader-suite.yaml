@@ -1,0 +1,28 @@
+schema_version: 1
+plugin_type: grader
+cases:
+  - name: accepts-supported-answer
+    answer: "Clinic hours are supported."
+    config:
+      values: ["supported"]
+    expected_grade:
+      grader: contains_all
+      score: 1.0
+      passed: true
+
+  - name: rejects-missing-required-text
+    answer: "I do not know."
+    config:
+      values: ["supported"]
+    expected_grade:
+      grader: contains_all
+      score: 0.0
+      passed: false
+
+  - name: reports-invalid-config
+    answer: "Clinic hours are supported."
+    config:
+      values: "supported"
+    expect_error:
+      type: GraderError
+      contains: "non-empty list"

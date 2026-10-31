@@ -38,13 +38,20 @@ def list_scenario_drafts(directory: Path) -> list[dict[str, Any]]:
         duplicate_of = seen_inputs.get(fingerprint)
         seen_inputs.setdefault(fingerprint, path.name)
         review = document.get("review", {})
-        rows.append({
+        row = {
             "file": path.name,
             "scenario": document.get("scenario"),
             "status": review.get("status", "pending") if isinstance(review, dict) else "pending",
             "reviewer": review.get("reviewer") if isinstance(review, dict) else None,
             "duplicate_of": duplicate_of,
-        })
+        }
+        if "minimized_failure" in document:
+            try:
+                row["evidence_integrity"] = verify_minimized_failure_draft(path)["verified"]
+            except DraftError as exc:
+                row["evidence_integrity"] = False
+                row["integrity_error"] = str(exc)
+        rows.append(row)
     return rows
 
 
@@ -56,6 +63,7 @@ def review_scenario_draft(
     if not reviewer.strip():
         raise DraftError("reviewer must be a non-empty name")
     document = _read_draft(path)
+    _verify_draft_evidence(document, path)
     if status == "approved":
         _validate_approved_draft(document, path)
     document["review"] = {
@@ -72,6 +80,7 @@ def promote_scenario_draft(
     path: Path, output_dir: Path, *, allow_duplicate: bool = False,
 ) -> dict[str, Any]:
     document = _read_draft(path)
+    _verify_draft_evidence(document, path)
     review = document.get("review", {})
     if not isinstance(review, dict) or review.get("status") != "approved":
         raise DraftError("only approved drafts can be promoted")
@@ -278,15 +287,25 @@ def create_minimized_failure_draft(
     if result.get("scenario") != scenario_id:
         raise DraftError("minimized result scenario does not match minimized_scenario.name")
     try:
-        result = redact_document(result, load_redaction_rules(redaction_config))
+        report = redact_document(report, load_redaction_rules(redaction_config))
     except Exception as exc:
         raise DraftError(f"could not redact minimized failure trace: {exc}") from exc
+    minimized = report.get("minimized_scenario")
+    result = report.get("result")
+    if not isinstance(minimized, dict) or not isinstance(result, dict):
+        raise DraftError("redaction removed required minimized scenario or result evidence")
+    user_input = minimized.get("input") if isinstance(minimized, dict) else None
+    if not isinstance(user_input, dict) or not user_input:
+        raise DraftError("redacted minimized scenario needs a non-empty input mapping")
     if output_dir.exists():
         raise DraftError(f"draft output directory already exists: {output_dir}")
 
     safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", scenario_id).strip("._-") or "scenario"
     draft_name = f"{safe_name}-minimized-review.yaml"
+    report_name = f"{safe_name}-minimized-report.json"
     trace_name = f"{safe_name}-minimized-trace.json"
+    report_bytes = (json.dumps(report, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+    trace_bytes = (json.dumps(result, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
     draft = {
         "draft": True,
         "scenario": scenario_id,
@@ -304,16 +323,22 @@ def create_minimized_failure_draft(
             "source_report": report_path.name,
             "failure_category": report.get("target_failure_category"),
             "first_divergence": report.get("first_divergence"),
-            "trace_file": trace_name,
+            "evidence_integrity": {
+                "algorithm": "sha256",
+                "report_file": report_name,
+                "report_sha256": sha256(report_bytes).hexdigest(),
+                "trace_file": trace_name,
+                "trace_sha256": sha256(trace_bytes).hexdigest(),
+            },
             "replay": replay,
         },
         "review": {"status": "pending"},
     }
     try:
+        output_dir.parent.mkdir(parents=True, exist_ok=True)
         output_dir.mkdir(parents=True)
-        (output_dir / trace_name).write_text(
-            json.dumps(result, indent=2, ensure_ascii=False) + "\n", encoding="utf-8",
-        )
+        (output_dir / report_name).write_bytes(report_bytes)
+        (output_dir / trace_name).write_bytes(trace_bytes)
         (output_dir / draft_name).write_text(
             "# Review-only regression draft from a replay-verified minimized failure.\n"
             "# Fill expected behavior from the product policy before approval.\n"
@@ -324,8 +349,44 @@ def create_minimized_failure_draft(
         raise DraftError(f"could not create minimized failure draft: {exc}") from exc
     return {
         "draft_count": 1, "output_dir": str(output_dir), "file": draft_name,
-        "trace_file": trace_name, "status": "pending",
+        "report_file": report_name, "trace_file": trace_name, "status": "pending",
     }
+
+
+def verify_minimized_failure_draft(path: Path) -> dict[str, Any]:
+    """Verify the attached report and trace bytes against the draft's SHA-256 manifest."""
+    document = _read_draft(path)
+    integrity = _evidence_manifest(document, path)
+    files: dict[str, str] = {}
+    for kind in ("report", "trace"):
+        file_name = integrity.get(f"{kind}_file")
+        expected = integrity.get(f"{kind}_sha256")
+        if (not isinstance(file_name, str) or not file_name or Path(file_name).name != file_name
+                or not isinstance(expected, str) or not re.fullmatch(r"[0-9a-f]{64}", expected)):
+            raise DraftError(f"{path}: invalid minimized failure {kind} integrity entry")
+        attached = path.parent / file_name
+        if attached.is_symlink() or not attached.is_file():
+            raise DraftError(f"{path}: minimized failure {kind} evidence is missing or not a regular file")
+        actual = sha256(attached.read_bytes()).hexdigest()
+        if actual != expected:
+            raise DraftError(f"{path}: minimized failure {kind} evidence integrity mismatch")
+        files[kind] = actual
+    return {"verified": True, "algorithm": "sha256", "files": files}
+
+
+def _evidence_manifest(document: dict[str, Any], path: Path) -> dict[str, Any]:
+    minimized = document.get("minimized_failure")
+    if not isinstance(minimized, dict):
+        return {}
+    integrity = minimized.get("evidence_integrity")
+    if not isinstance(integrity, dict) or integrity.get("algorithm") != "sha256":
+        raise DraftError(f"{path}: minimized failure draft is missing its evidence integrity manifest")
+    return integrity
+
+
+def _verify_draft_evidence(document: dict[str, Any], path: Path) -> None:
+    if "minimized_failure" in document:
+        verify_minimized_failure_draft(path)
 
 
 def _slug(value: str) -> str:

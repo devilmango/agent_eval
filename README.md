@@ -725,7 +725,7 @@ agent-eval draft-minimized-failure minimized-failure.json \
   --output-dir regression-drafts/
 ```
 
-The command accepts only reports whose original failure and replay are both verified. It writes a YAML draft and a neighboring JSON trace file, linked from `minimized_failure.trace_file`. Use `--redaction-config` to remove or mask sensitive trace fields before writing. The draft starts with `review.status: pending`; `expected.intent`, `expected.must_ask`, `expected.tools`, and `must_not` are unset. Review the attached trace and product policy, fill in expected behavior, then use `drafts review` and `drafts promote` as for other drafts. The observed failure is never copied into the expected fields.
+The command accepts only reports whose original failure and replay are both verified. It writes a YAML draft, a redacted report copy, and a minimized trace. SHA-256 hashes for the attached evidence are stored in `minimized_failure.evidence_integrity`. Use `--redaction-config` to remove or mask sensitive fields before writing. Inspect evidence integrity with `agent-eval drafts verify regression-drafts/appointment_reschedule-minimized-review.yaml`; listing drafts also reports integrity status. Review and promotion verify both hashes and stop if evidence is missing or changed. The draft starts with `review.status: pending`; `expected.intent`, `expected.must_ask`, `expected.tools`, and `must_not` are unset. Review the attached trace and product policy, fill in expected behavior, then use `drafts review` and `drafts promote` as for other drafts. The observed failure is never copied into the expected fields.
 
 ### Check runner and grader plugins
 
@@ -736,9 +736,41 @@ agent-eval conformance runner my-agent
 agent-eval conformance grader my-grader \
   --config-json '{"values":["example"]}' \
   --answer "The example is supported."
+
+agent-eval conformance runner my-agent \
+  --suite examples/conformance/runner-suite.yaml
+
+agent-eval conformance grader contains_all \
+  --suite examples/conformance/grader-suite.yaml
 ```
 
-The command exits `0` when all checks pass and `1` when a contract check fails. Runner checks exercise the callable interface, canonical trace structure, repeatability, cooperative cancellation through `execution_control`, and normalization of runner errors. Grader checks exercise `grade(answer, config)`, the normalized `GradeResult` shape, deterministic repeated output, and grader-error normalization. JSON reports are available with `--format json`; grader probe inputs can be tailored with `--config-json` and `--answer`. These checks invoke the plugin, so runner probes may use whatever model or services the installed runner normally uses. The Python API is also available as `check_runner_conformance(runner)` and `check_grader_conformance(grader, config=..., answer=...)` from `agent_eval.conformance`.
+The command exits `0` when all checks pass and `1` when a contract check fails. Runner checks exercise the callable interface, canonical trace structure, repeatability, cooperative cancellation through `execution_control`, and normalization of runner errors. Grader checks exercise `grade(answer, config)`, the normalized `GradeResult` shape, deterministic repeated output, and grader-error normalization. Fixture suites use `schema_version: 1` and named cases. Runner cases contain a normal scenario document (including `tool_fixtures`) plus an `expected_trace`, an `expect_error`, or a `cancellation` instruction. Expected trace mappings check only the fields included; lists are compared exactly. Grader cases contain `answer`, `config`, and either `expected_grade` or `expect_error`. The checked-in runner suite is a template: adapt its scenario inputs to the behavior your plugin exposes. These checks invoke the plugin, so runner probes may use whatever model or services the installed runner normally uses. JSON reports are available with `--format json`; grader probe inputs can be tailored with `--config-json` and `--answer`. The Python API is also available as `check_runner_conformance(runner, suite=...)` and `check_grader_conformance(grader, suite=...)` from `agent_eval.conformance`.
+
+Run the same suite in multiple Python and Agent Eval installations with a target manifest:
+
+```yaml
+schema_version: 1
+targets:
+  - name: python-3.10-agent-eval-current
+    python: /opt/venvs/agent-eval-py310/bin/python
+    python_version: "3.10"
+    agent_eval_version: "0.1.0"
+  - name: python-3.12-agent-eval-current
+    python: /opt/venvs/agent-eval-py312/bin/python
+    python_version: "3.12"
+    agent_eval_version: "0.1.0"
+```
+
+Each target environment must have Agent Eval and the plugin installed. Run and save the compatibility report with:
+
+```bash
+agent-eval conformance-matrix runner my-agent \
+  --suite examples/conformance/runner-suite.yaml \
+  --targets conformance-targets.yaml \
+  --format json --output conformance-matrix.json
+```
+
+The matrix checks the imported Python and Agent Eval versions against optional target pins, records each target's fixture and capability results, and exits `1` if any target or check fails. `examples/conformance/targets.yaml` shows the target format. Set `--grader-config-json` and `--grader-answer` for a grader's generic probe; fixture cases in the suite still run individually.
 
 Compare a candidate run with a baseline to see scenario regressions and metric changes:
 

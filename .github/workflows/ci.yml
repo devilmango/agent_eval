@@ -32,6 +32,10 @@ jobs:
           agent-eval calibrate-grounding examples/evidence-grounding-gold.yaml --min-accuracy 1.0 --format json --output agent-eval-grounding-calibration.json
       - name: Validate privacy, refusal, and confirmation safety examples
         run: agent-eval run examples/safety/ --responses examples/safety/responses.jsonl --strict --format json --output agent-eval-safety.json
+      - name: Validate grader fixtures and Python compatibility matrix
+        run: |
+          agent-eval conformance grader contains_all --suite examples/conformance/grader-suite.yaml --format json --output agent-eval-grader-conformance.json
+          agent-eval conformance-matrix grader contains_all --suite examples/conformance/grader-suite.yaml --targets examples/conformance/targets.yaml --format json --output agent-eval-conformance-matrix.json
       - name: Check repeated-run confidence gate
         run: agent-eval repeat scenarios/ --runs examples/responses.jsonl examples/responses.jsonl --min-runs 2 --confidence 0.95 --min-pass-rate 0.60 --strict --format html --output agent-eval-stability.html
       - name: Audit scenario coverage and mutation sensitivity
@@ -81,6 +85,8 @@ jobs:
             agent-eval.sarif
             agent-eval-grounding-calibration.json
             agent-eval-safety.json
+            agent-eval-grader-conformance.json
+            agent-eval-conformance-matrix.json
             agent-eval-stability.html
             agent-eval-coverage.json
             agent-eval-mutations.json
