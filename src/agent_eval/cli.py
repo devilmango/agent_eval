@@ -27,11 +27,12 @@ from agent_eval.baseline_history import (BaselineHistoryError, append_baseline_h
 from agent_eval.budgets import apply_budgets
 from agent_eval.comparison import compare_reports, paired_bootstrap_intervals, text_comparison
 from agent_eval.drafts import (
-    DraftError, create_scenario_drafts, list_scenario_drafts,
+    DraftError, create_minimized_failure_draft, create_scenario_drafts, list_scenario_drafts,
     promote_scenario_draft, review_scenario_draft,
 )
+from agent_eval.conformance import check_grader_conformance, check_runner_conformance
 from agent_eval.gate_profiles import GateProfileError, evaluate_release_gates, load_gate_profile, text_release_gate_report
-from agent_eval.graders import GraderError, load_judge_registry
+from agent_eval.graders import GraderError, load_grader_registry, load_judge_registry
 from agent_eval.history import (HistoryError, compare_history, filter_history, html_history_comparison,
                                 html_trend_report, load_history, merge_history, record_history,
                                 text_history_comparison, text_trend_report, trend_report)
@@ -326,6 +327,24 @@ def build_parser() -> argparse.ArgumentParser:
     minimize.add_argument("--seed", type=int, default=0, help="seed passed to replay-aware runners (default: 0)")
     minimize.add_argument("--scenario-timeout", type=float, help="per-attempt timeout for replay runs")
 
+    minimized_draft = commands.add_parser(
+        "draft-minimized-failure",
+        help="create a pending regression draft from a replay-verified minimized failure",
+    )
+    minimized_draft.add_argument("report", type=Path, help="JSON report produced by replay-backed minimize")
+    minimized_draft.add_argument("--output-dir", required=True, type=Path, help="new directory for the draft and attached trace")
+    minimized_draft.add_argument("--redaction-config", type=Path, help="redact configured trace fields before writing the draft")
+    minimized_draft.add_argument("--format", choices=("text", "json"), default="text")
+    minimized_draft.add_argument("--output", type=Path, help="write the creation summary to a file")
+
+    conformance = commands.add_parser("conformance", help="run reusable plugin contract checks")
+    conformance.add_argument("plugin_type", choices=("runner", "grader"))
+    conformance.add_argument("name", help="installed runner or grader entry-point name")
+    conformance.add_argument("--config-json", default="{}", help="grader probe config as a JSON object")
+    conformance.add_argument("--answer", default="Conformance probe", help="grader probe answer")
+    conformance.add_argument("--format", choices=("text", "json"), default="text")
+    conformance.add_argument("--output", type=Path, help="write the conformance report to a file")
+
     investigate = commands.add_parser("investigate", help="rerun failed scenarios to classify reproducibility")
     investigate.add_argument("scenarios", type=Path, help="scenario YAML file or directory")
     investigate.add_argument("--responses", required=True, type=Path, help="baseline JSONL containing failed results")
@@ -618,6 +637,43 @@ def main(argv: list[str] | None = None) -> int:
             report = minimize_failure(scenario, result, replay=replay)
             _write_output(args.output, json.dumps(report, indent=2, ensure_ascii=False))
             return 0
+
+        if args.command == "draft-minimized-failure":
+            created = create_minimized_failure_draft(
+                args.report, args.output_dir, redaction_config=args.redaction_config,
+            )
+            rendered = json.dumps(created, indent=2, ensure_ascii=False) if args.format == "json" else (
+                f"Created pending regression draft {created['file']} in {created['output_dir']}\n"
+                f"Attached minimized trace: {created['trace_file']}\n"
+                "Expected behavior remains blank for human review."
+            )
+            _write_output(args.output, rendered)
+            return 0
+
+        if args.command == "conformance":
+            if args.plugin_type == "runner":
+                report = check_runner_conformance(load_runner(args.name))
+            else:
+                try:
+                    config = json.loads(args.config_json)
+                except json.JSONDecodeError as exc:
+                    raise ValueError(f"--config-json is not valid JSON: {exc.msg}") from exc
+                if not isinstance(config, dict):
+                    raise ValueError("--config-json must decode to a JSON object")
+                graders = load_grader_registry()
+                grader = graders.get(args.name)
+                if grader is None:
+                    raise GraderError(f"unknown grader '{args.name}' (available: {', '.join(sorted(graders))})")
+                report = check_grader_conformance(grader, config=config, answer=args.answer)
+            if args.format == "json":
+                rendered = json.dumps(report, indent=2, ensure_ascii=False)
+            else:
+                lines = [f"{args.plugin_type.title()} conformance: {'PASS' if report['passed'] else 'FAIL'}"]
+                lines.extend(f"  {item['status'].upper():>6}  {item['name']}: {item['detail']}"
+                             for item in report["checks"])
+                rendered = "\n".join(lines)
+            _write_output(args.output, rendered)
+            return 0 if report["passed"] else 1
 
         if args.command == "verify-bundle":
             verification = verify_bundle(args.bundle)

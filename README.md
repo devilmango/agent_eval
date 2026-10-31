@@ -710,6 +710,36 @@ agent-eval drafts promote scenario-drafts/001-appointment_reschedule.yaml \
 
 Approval requires all expected-behavior placeholders to be filled, and promotion validates the resulting scenario. Exact-input duplicates are reported and promotion requires `--allow-duplicate` after review.
 
+### Review minimized failures as regression drafts
+
+Replay-backed minimization can produce a small, reproducible failure report. Turn a verified report into a pending scenario draft with the observed failure trace attached:
+
+```bash
+agent-eval minimize scenarios/ \
+  --responses failed-run.jsonl \
+  --scenario appointment_reschedule \
+  --runner my-agent \
+  --output minimized-failure.json
+
+agent-eval draft-minimized-failure minimized-failure.json \
+  --output-dir regression-drafts/
+```
+
+The command accepts only reports whose original failure and replay are both verified. It writes a YAML draft and a neighboring JSON trace file, linked from `minimized_failure.trace_file`. Use `--redaction-config` to remove or mask sensitive trace fields before writing. The draft starts with `review.status: pending`; `expected.intent`, `expected.must_ask`, `expected.tools`, and `must_not` are unset. Review the attached trace and product policy, fill in expected behavior, then use `drafts review` and `drafts promote` as for other drafts. The observed failure is never copied into the expected fields.
+
+### Check runner and grader plugins
+
+Plugin authors can use the same contract checks that ship with the CLI:
+
+```bash
+agent-eval conformance runner my-agent
+agent-eval conformance grader my-grader \
+  --config-json '{"values":["example"]}' \
+  --answer "The example is supported."
+```
+
+The command exits `0` when all checks pass and `1` when a contract check fails. Runner checks exercise the callable interface, canonical trace structure, repeatability, cooperative cancellation through `execution_control`, and normalization of runner errors. Grader checks exercise `grade(answer, config)`, the normalized `GradeResult` shape, deterministic repeated output, and grader-error normalization. JSON reports are available with `--format json`; grader probe inputs can be tailored with `--config-json` and `--answer`. These checks invoke the plugin, so runner probes may use whatever model or services the installed runner normally uses. The Python API is also available as `check_runner_conformance(runner)` and `check_grader_conformance(grader, config=..., answer=...)` from `agent_eval.conformance`.
+
 Compare a candidate run with a baseline to see scenario regressions and metric changes:
 
 ```bash

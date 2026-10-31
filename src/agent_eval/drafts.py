@@ -248,6 +248,86 @@ def create_scenario_drafts(
     }
 
 
+def create_minimized_failure_draft(
+    report_path: Path, output_dir: Path, *, redaction_config: Path | None = None,
+) -> dict[str, Any]:
+    """Create one review-only scenario draft from a replay-verified minimization report.
+
+    The minimized result is retained as an adjacent JSON trace artifact. Expected
+    behavior is intentionally blank: the failed observation is evidence for review,
+    never an oracle for the new regression scenario.
+    """
+    try:
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise DraftError(f"could not read minimized failure report {report_path}: {exc}") from exc
+    if not isinstance(report, dict):
+        raise DraftError("minimized failure report must contain a JSON object")
+    replay = report.get("replay")
+    if (report.get("reproduction_verified") is not True or not isinstance(replay, dict)
+            or replay.get("enabled") is not True or replay.get("verified") is not True):
+        raise DraftError("only replay-verified minimized failures can become regression drafts")
+    minimized = report.get("minimized_scenario")
+    result = report.get("result")
+    if not isinstance(minimized, dict) or not isinstance(result, dict):
+        raise DraftError("minimized report needs minimized_scenario and result objects")
+    scenario_id = minimized.get("name", report.get("scenario"))
+    user_input = minimized.get("input")
+    if not isinstance(scenario_id, str) or not scenario_id.strip() or not isinstance(user_input, dict) or not user_input:
+        raise DraftError("minimized report needs a scenario name and non-empty input mapping")
+    if result.get("scenario") != scenario_id:
+        raise DraftError("minimized result scenario does not match minimized_scenario.name")
+    try:
+        result = redact_document(result, load_redaction_rules(redaction_config))
+    except Exception as exc:
+        raise DraftError(f"could not redact minimized failure trace: {exc}") from exc
+    if output_dir.exists():
+        raise DraftError(f"draft output directory already exists: {output_dir}")
+
+    safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", scenario_id).strip("._-") or "scenario"
+    draft_name = f"{safe_name}-minimized-review.yaml"
+    trace_name = f"{safe_name}-minimized-trace.json"
+    draft = {
+        "draft": True,
+        "scenario": scenario_id,
+        "version": minimized.get("version", 1),
+        "input": user_input,
+        "observed": {
+            "intent": result.get("intent"),
+            "asked": result.get("asked", []),
+            "tools": result.get("tools", []),
+            "actions": result.get("actions", []),
+        },
+        "expected": {"intent": None, "must_ask": None, "tools": None},
+        "must_not": None,
+        "minimized_failure": {
+            "source_report": report_path.name,
+            "failure_category": report.get("target_failure_category"),
+            "first_divergence": report.get("first_divergence"),
+            "trace_file": trace_name,
+            "replay": replay,
+        },
+        "review": {"status": "pending"},
+    }
+    try:
+        output_dir.mkdir(parents=True)
+        (output_dir / trace_name).write_text(
+            json.dumps(result, indent=2, ensure_ascii=False) + "\n", encoding="utf-8",
+        )
+        (output_dir / draft_name).write_text(
+            "# Review-only regression draft from a replay-verified minimized failure.\n"
+            "# Fill expected behavior from the product policy before approval.\n"
+            + yaml.safe_dump(draft, sort_keys=False, allow_unicode=True), encoding="utf-8",
+        )
+    except OSError as exc:
+        shutil.rmtree(output_dir, ignore_errors=True)
+        raise DraftError(f"could not create minimized failure draft: {exc}") from exc
+    return {
+        "draft_count": 1, "output_dir": str(output_dir), "file": draft_name,
+        "trace_file": trace_name, "status": "pending",
+    }
+
+
 def _slug(value: str) -> str:
     slug = re.sub(r"[^a-zA-Z0-9_-]+", "_", value.strip()).strip("_-").lower()
     return slug or "trace"
