@@ -36,6 +36,8 @@ jobs:
         run: |
           agent-eval conformance grader contains_all --suite examples/conformance/grader-suite.yaml --format json --output agent-eval-grader-conformance.json
           agent-eval conformance-matrix grader contains_all --suite examples/conformance/grader-suite.yaml --targets examples/conformance/targets.yaml --format json --output agent-eval-conformance-matrix.json
+          agent-eval conformance-history record agent-eval-conformance-matrix.json --store agent-eval-conformance-history.jsonl --plugin-version 0.1.0
+          agent-eval conformance-history trend agent-eval-conformance-history.jsonl --format json --output agent-eval-conformance-trend.json
       - name: Check repeated-run confidence gate
         run: agent-eval repeat scenarios/ --runs examples/responses.jsonl examples/responses.jsonl --min-runs 2 --confidence 0.95 --min-pass-rate 0.60 --strict --format html --output agent-eval-stability.html
       - name: Audit scenario coverage and mutation sensitivity
@@ -87,6 +89,8 @@ jobs:
             agent-eval-safety.json
             agent-eval-grader-conformance.json
             agent-eval-conformance-matrix.json
+            agent-eval-conformance-history.jsonl
+            agent-eval-conformance-trend.json
             agent-eval-stability.html
             agent-eval-coverage.json
             agent-eval-mutations.json

@@ -106,6 +106,27 @@ class CacheMaintenanceTests(unittest.TestCase):
 
 
 class FailureMinimizationTests(unittest.TestCase):
+    def test_replay_minimization_records_reproduction_provenance(self):
+        scenario = Scenario(name="visit", input={"user": "reschedule"}, intent="RESCHEDULE")
+        baseline = AgentResult(scenario="visit", intent="CANCEL")
+
+        def replay(candidate):
+            return AgentResult(scenario=candidate.name, intent="CANCEL",
+                               metadata={"model": "fixture-model", "prompt_version": "prompt-v3"})
+
+        report = minimize_failure(
+            scenario, baseline, replay=replay,
+            provenance={"runner": "fixture", "runner_version": "1.4", "seed": 13,
+                        "evaluation_config": {"scenario_timeout_seconds": 5}},
+        )
+        provenance = report["provenance"]
+        self.assertEqual(provenance["runner"], "fixture")
+        self.assertEqual(provenance["model"], "fixture-model")
+        self.assertEqual(provenance["prompt_version"], "prompt-v3")
+        self.assertEqual(provenance["seed"], 13)
+        self.assertEqual(len(provenance["evaluation_config_fingerprint"]), 64)
+        self.assertEqual(len(provenance["manifest_fingerprint"]), 64)
+
     def test_minimizer_keeps_only_turn_needed_for_original_failure(self):
         scenario = Scenario(name="visit", input={"user": "first"}, intent="DONE", turns=(
             ScenarioTurn(input={"user": "first"}, intent="ASK"),

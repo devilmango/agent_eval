@@ -727,6 +727,8 @@ agent-eval draft-minimized-failure minimized-failure.json \
 
 The command accepts only reports whose original failure and replay are both verified. It writes a YAML draft, a redacted report copy, and a minimized trace. SHA-256 hashes for the attached evidence are stored in `minimized_failure.evidence_integrity`. Use `--redaction-config` to remove or mask sensitive fields before writing. Inspect evidence integrity with `agent-eval drafts verify regression-drafts/appointment_reschedule-minimized-review.yaml`; listing drafts also reports integrity status. Review and promotion verify both hashes and stop if evidence is missing or changed. The draft starts with `review.status: pending`; `expected.intent`, `expected.must_ask`, `expected.tools`, and `must_not` are unset. Review the attached trace and product policy, fill in expected behavior, then use `drafts review` and `drafts promote` as for other drafts. The observed failure is never copied into the expected fields.
 
+Replay-backed reports include a provenance manifest with the runner name/version, model, prompt version and fingerprint, random seed, effective evaluation settings, and stable fingerprints of the scenario and config. The review draft carries this manifest with the evidence. Prompt text and tool fixture contents are not copied into the provenance fields; the scenario and attached report remain the replay inputs and can be redacted before drafting. Older saved reports are still accepted and are explicitly marked as lacking provenance.
+
 ### Check runner and grader plugins
 
 Plugin authors can use the same contract checks that ship with the CLI:
@@ -771,6 +773,17 @@ agent-eval conformance-matrix runner my-agent \
 ```
 
 The matrix checks the imported Python and Agent Eval versions against optional target pins, records each target's fixture and capability results, and exits `1` if any target or check fails. `examples/conformance/targets.yaml` shows the target format. Set `--grader-config-json` and `--grader-answer` for a grader's generic probe; fixture cases in the suite still run individually.
+
+Record reports from successive plugin releases in an append-only JSONL file, then ask when checks first failed or became intermittent:
+
+```bash
+agent-eval conformance-history record conformance-matrix.json \
+  --store conformance-history.jsonl --plugin-version 1.4.0
+agent-eval conformance-history trend conformance-history.jsonl \
+  --plugin my-agent --format json --output conformance-trend.json
+```
+
+`record` accepts both single-plugin conformance reports and compatibility matrices. It stores check names/statuses, release labels, and runtime targets, without fixture inputs or observed answer content. Keep the JSONL store as a CI artifact or in durable storage across releases; each trend row reports the current status, full recorded timeline, first failure, first regression after a passing run, and the release where outcomes first became intermittent. Use `--target` to narrow the view to one matrix environment and `--limit N` to inspect its most recent target runs. Compare release tags from the same plugin lineage to avoid mixing unrelated builds.
 
 Compare a candidate run with a baseline to see scenario regressions and metric changes:
 

@@ -32,6 +32,9 @@ from agent_eval.drafts import (
 )
 from agent_eval.conformance import (check_grader_conformance, check_runner_conformance,
                                     run_conformance_matrix)
+from agent_eval.conformance_history import (ConformanceHistoryError, conformance_trend_report,
+                                            load_conformance_history, record_conformance_report,
+                                            text_conformance_trend_report)
 from agent_eval.gate_profiles import GateProfileError, evaluate_release_gates, load_gate_profile, text_release_gate_report
 from agent_eval.graders import GraderError, load_grader_registry, load_judge_registry
 from agent_eval.history import (HistoryError, compare_history, filter_history, html_history_comparison,
@@ -47,7 +50,8 @@ from agent_eval.minimize import MinimizeError, minimize_failure
 from agent_eval.otel import OpenTelemetryAdapter, load_otel_document
 from agent_eval.portable_baseline import (PortableBaselineError, export_portable_baseline,
                                           import_portable_baseline)
-from agent_eval.provenance import attach_provenance, compare_result_provenance, provenance_manifest
+from agent_eval.provenance import (attach_provenance, compare_result_provenance, fingerprint,
+                                   provenance_manifest)
 from agent_eval.quality import failure_analysis, mutation_report, scenario_coverage, scenario_suggestions, judge_agreement, text_coverage, text_mutation_report, text_failure_analysis
 from agent_eval.report import (html_report, json_report, junit_report, repeated_html_report,
                                sarif_report, text_report)
@@ -58,7 +62,8 @@ from agent_eval.redaction import (
 from agent_eval.robustness import VARIANT_TYPES, run_robustness
 from agent_eval.repeated import analyze_repeated_runs, text_repeated_report
 from agent_eval.results import ResultError, load_results
-from agent_eval.runner import RunnerError, execute_scenarios, execution_runner_key, load_runner
+from agent_eval.runner import (RunnerError, _scenario_fingerprint, execute_scenarios,
+                               execution_runner_key, load_runner)
 from agent_eval.scenarios import ScenarioError, filter_scenarios, load_scenarios
 from agent_eval.scoring import evaluate
 from agent_eval.scenario_audit import audit_scenarios, text_scenario_audit
@@ -362,6 +367,30 @@ def build_parser() -> argparse.ArgumentParser:
     conformance_matrix.add_argument("--format", choices=("text", "json"), default="text")
     conformance_matrix.add_argument("--output", type=Path, help="write the compatibility matrix to a file")
 
+    conformance_history = commands.add_parser(
+        "conformance-history", help="record plugin conformance releases and inspect contract trends",
+    )
+    conformance_history_commands = conformance_history.add_subparsers(
+        dest="conformance_history_command", required=True,
+    )
+    conformance_history_record = conformance_history_commands.add_parser(
+        "record", help="append a conformance report to a JSONL history store",
+    )
+    conformance_history_record.add_argument("report", type=Path, help="conformance or matrix JSON report")
+    conformance_history_record.add_argument("--store", required=True, type=Path, help="append-only history JSONL")
+    conformance_history_record.add_argument("--plugin-version", help="plugin release represented by this report")
+    conformance_history_record.add_argument("--format", choices=("text", "json"), default="text")
+    conformance_history_record.add_argument("--output", type=Path)
+    conformance_history_trend = conformance_history_commands.add_parser(
+        "trend", help="report regressions and intermittent checks across recorded releases",
+    )
+    conformance_history_trend.add_argument("store", type=Path, help="conformance history JSONL")
+    conformance_history_trend.add_argument("--plugin", help="filter by plugin entry-point name")
+    conformance_history_trend.add_argument("--target", help="filter by compatibility target")
+    conformance_history_trend.add_argument("--limit", type=int, help="use only the latest N target runs")
+    conformance_history_trend.add_argument("--format", choices=("text", "json"), default="text")
+    conformance_history_trend.add_argument("--output", type=Path)
+
     investigate = commands.add_parser("investigate", help="rerun failed scenarios to classify reproducibility")
     investigate.add_argument("scenarios", type=Path, help="scenario YAML file or directory")
     investigate.add_argument("--responses", required=True, type=Path, help="baseline JSONL containing failed results")
@@ -641,8 +670,28 @@ def main(argv: list[str] | None = None) -> int:
             if result is None:
                 raise MinimizeError(f"no recorded result for scenario '{args.scenario}'")
             replay = None
+            provenance = None
             if args.runner:
-                load_runner(args.runner)  # validate the plugin before entering the reducer
+                runner_plugin = load_runner(args.runner)  # validate before entering the reducer
+
+                effective_config = {
+                    "seed": args.seed,
+                    "scenario_timeout_seconds": args.scenario_timeout,
+                    "skip_semantic_judges": True,
+                    "scenario_fingerprint": _scenario_fingerprint(scenario),
+                }
+                provenance = {
+                    "runner": args.runner,
+                    "runner_version": str(getattr(runner_plugin, "version", "unknown")),
+                    "seed": args.seed,
+                    "evaluation_config": effective_config,
+                    "model": result.metadata.get("model"),
+                    "prompt_version": result.metadata.get("prompt_version"),
+                    "prompt_fingerprint": (
+                        fingerprint(result.metadata.get("prompt_version"))
+                        if result.metadata.get("prompt_version") is not None else None
+                    ),
+                }
 
                 def replay(candidate):
                     runner = load_runner(args.runner)
@@ -651,7 +700,7 @@ def main(argv: list[str] | None = None) -> int:
                     )
                     return replayed_result
 
-            report = minimize_failure(scenario, result, replay=replay)
+            report = minimize_failure(scenario, result, replay=replay, provenance=provenance)
             _write_output(args.output, json.dumps(report, indent=2, ensure_ascii=False))
             return 0
 
@@ -691,6 +740,25 @@ def main(argv: list[str] | None = None) -> int:
                 rendered = "\n".join(lines)
             _write_output(args.output, rendered)
             return 0 if report["passed"] else 1
+
+        if args.command == "conformance-history":
+            if args.conformance_history_command == "record":
+                report = record_conformance_report(
+                    args.report, args.store, plugin_version=args.plugin_version,
+                )
+                rendered = json.dumps(report, indent=2, ensure_ascii=False) if args.format == "json" else (
+                    f"Recorded {report['record_count']} conformance target run(s) for "
+                    f"{report['plugin_version']} in {report['store']}"
+                )
+            else:
+                history_rows = load_conformance_history(args.store)
+                report = conformance_trend_report(
+                    history_rows, plugin=args.plugin, target=args.target, limit=args.limit,
+                )
+                rendered = (json.dumps(report, indent=2, ensure_ascii=False)
+                            if args.format == "json" else text_conformance_trend_report(report))
+            _write_output(args.output, rendered)
+            return 0
 
         if args.command == "conformance-matrix":
             grader_config = None
@@ -1592,7 +1660,7 @@ def main(argv: list[str] | None = None) -> int:
                                        "max_input_tokens": args.max_input_tokens,
                                        "max_output_tokens": args.max_output_tokens,
                                        "max_p95_latency_ms": args.max_p95_latency_ms}})
-    except (AdapterError, BundleError, CacheError, DraftError, GateProfileError, HistoryError,
+    except (AdapterError, BundleError, CacheError, ConformanceHistoryError, DraftError, GateProfileError, HistoryError,
             GraderError, MinimizeError, RedactionError, RunnerError, ScenarioError, ResultError,
             OSError, ValueError) as exc:
         print(f"agent-eval: error: {exc}", file=sys.stderr)

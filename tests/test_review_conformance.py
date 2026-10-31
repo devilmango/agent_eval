@@ -11,6 +11,8 @@ import yaml
 
 from agent_eval.conformance import (check_grader_conformance, check_runner_conformance,
                                     run_conformance_matrix, _load_suite)
+from agent_eval.conformance_history import (conformance_trend_report, load_conformance_history,
+                                            record_conformance_report)
 from agent_eval.cli import main
 from agent_eval.drafts import (DraftError, create_minimized_failure_draft,
                                promote_scenario_draft, review_scenario_draft)
@@ -83,6 +85,8 @@ class ReviewAndConformanceTests(unittest.TestCase):
             "target_failure_category": "intent",
             "reproduction_verified": True,
             "replay": {"enabled": True, "verified": True, "attempts": 4},
+            "provenance": {"runner": "fixture", "model": "model-a", "prompt_version": "p2",
+                           "seed": 7, "evaluation_config_fingerprint": "abc123"},
             "minimized_scenario": {
                 "name": "appointment_reschedule",
                 "input": {"user": "Move my appointment"},
@@ -107,6 +111,7 @@ class ReviewAndConformanceTests(unittest.TestCase):
             self.assertTrue(draft["draft"])
             self.assertEqual(draft["review"]["status"], "pending")
             self.assertIsNone(draft["expected"]["intent"])
+            self.assertEqual(draft["minimized_failure"]["provenance"]["runner"], "fixture")
             trace_path = output / draft["minimized_failure"]["evidence_integrity"]["trace_file"]
             self.assertTrue(trace_path.is_file())
             self.assertEqual(json.loads(trace_path.read_text())['events'][0]['name'], "cancel_appointment")
@@ -251,6 +256,48 @@ class ReviewAndConformanceTests(unittest.TestCase):
             mismatch = run_conformance_matrix("grader", "contains_all", suite_path, targets_path)
             self.assertFalse(mismatch["passed"])
             self.assertIn("version_errors", mismatch["targets"][0])
+
+    def test_conformance_history_identifies_release_regression_and_intermitency(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = root / "history.jsonl"
+            reports = [
+                ("1.0.0", True), ("2.0.0", False), ("3.0.0", True),
+            ]
+            for version, passed in reports:
+                report_path = root / f"{version}.json"
+                report_path.write_text(json.dumps({
+                    "plugin_type": "grader", "plugin": "sample-grader", "passed": passed,
+                    "checks": [{"name": "determinism", "status": "passed" if passed else "failed"}],
+                    "fixture_cases": [{"name": "empty-answer", "status": "passed" if passed else "failed"}],
+                }), encoding="utf-8")
+                record_conformance_report(report_path, store, plugin_version=version)
+            rows = load_conformance_history(store)
+            trend = conformance_trend_report(rows, plugin="sample-grader")
+        self.assertEqual(trend["record_count"], 3)
+        self.assertEqual(trend["regression_count"], 2)
+        self.assertEqual(trend["intermittent_count"], 2)
+        check = next(row for row in trend["checks"] if row["check"] == "determinism")
+        self.assertEqual(check["first_regression_version"], "2.0.0")
+        self.assertEqual(check["intermittent_since_version"], "2.0.0")
+        self.assertEqual(check["current_status"], "passed")
+
+    def test_conformance_history_cli_records_and_renders_trend(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "report.json"
+            source.write_text(json.dumps({
+                "plugin_type": "runner", "plugin": "sample-runner", "passed": True,
+                "checks": [{"name": "trace_structure", "status": "passed"}],
+            }), encoding="utf-8")
+            store = root / "nested" / "history.jsonl"
+            self.assertEqual(main(["conformance-history", "record", str(source), "--store", str(store),
+                                   "--plugin-version", "1.2.3"]), 0)
+            output = StringIO()
+            with redirect_stdout(output):
+                status = main(["conformance-history", "trend", str(store), "--format", "json"])
+        self.assertEqual(status, 0)
+        self.assertEqual(json.loads(output.getvalue())["checks"][0]["check"], "trace_structure")
 
     def test_drafts_verify_cli_checks_attached_report_and_trace(self):
         with tempfile.TemporaryDirectory() as directory:

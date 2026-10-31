@@ -10,6 +10,7 @@ from typing import Any
 
 from agent_eval.adapters import result_as_dict
 from agent_eval.models import AgentResult, AgentTurnResult, Scenario, TraceEvent
+from agent_eval.provenance import fingerprint
 from agent_eval.scoring import score_scenario
 
 
@@ -84,6 +85,7 @@ def _input_digest(value: Any) -> str:
 def minimize_failure(
     scenario: Scenario, result: AgentResult, *,
     replay: Callable[[Scenario], AgentResult] | None = None,
+    provenance: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Greedily remove turns, inputs, and optionally recorded trace events.
 
@@ -247,7 +249,7 @@ def minimize_failure(
     final_score = _score(current_scenario, current_result)
     if final_score.passed or target_category not in {item.category for item in final_score.diagnostics}:
         raise MinimizeError("failure could not be reproduced after reduction")
-    return {
+    report = {
         "scenario": scenario.name,
         "target_failure_category": target_category,
         "original_failure_categories": sorted(categories),
@@ -271,3 +273,21 @@ def minimize_failure(
         "remaining_failure_categories": sorted({item.category for item in final_score.diagnostics}),
         "first_divergence": asdict(final_score.diagnostics[0]) if final_score.diagnostics else None,
     }
+    if provenance is not None:
+        # Keep the effective settings visible while making the manifest stable
+        # for later replay and review. Prompt text is represented by a version
+        # and fingerprint rather than copied into a draft report.
+        manifest = dict(provenance)
+        observed_metadata = current_result.metadata
+        for field in ("model", "prompt_version"):
+            if observed_metadata.get(field) is not None:
+                manifest[field] = observed_metadata[field]
+        if manifest.get("prompt_version") is not None:
+            manifest["prompt_fingerprint"] = fingerprint(manifest["prompt_version"])
+        manifest.pop("evaluation_config_fingerprint", None)
+        manifest["evaluation_config_fingerprint"] = fingerprint(
+            manifest.get("evaluation_config", {})
+        )
+        manifest["manifest_fingerprint"] = fingerprint(manifest)
+        report["provenance"] = manifest
+    return report

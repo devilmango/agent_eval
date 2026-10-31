@@ -331,6 +331,10 @@ def create_minimized_failure_draft(
                 "trace_sha256": sha256(trace_bytes).hexdigest(),
             },
             "replay": replay,
+            "provenance": report.get("provenance", {
+                "available": False,
+                "note": "This minimized report predates replay provenance capture.",
+            }),
         },
         "review": {"status": "pending"},
     }
